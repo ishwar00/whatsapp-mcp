@@ -675,9 +675,9 @@ export class WhatsApp implements Sender {
         digest: null,
         size: Number(media.fileLength || 0),
         availability: "pending",
-      } satisfies import("./store.js").Attachment;
-      if (!this.store.get("attachment", attachmentId))
-        this.store.put("attachment", attachmentId, meta);
+      } satisfies import("./media.js").Attachment;
+      if (!this.store.attachments.get(attachmentId))
+        this.store.attachments.register(meta);
       if (
         source === "live" &&
         this.socket &&
@@ -695,10 +695,8 @@ export class WhatsApp implements Sender {
     }
   }
   async download(id: string) {
-    const parsed = z
-      .object({ messageId: z.string().nullable(), chatId: z.string() })
-      .parse(this.store.get("attachment", id));
-    if (!parsed.messageId) throw new Error("Media unavailable");
+    const parsed = this.store.attachments.get(id);
+    if (!parsed?.messageId) throw new BridgeError("media_unavailable");
     const raw = this.store.get("raw", parsed.messageId);
     if (!raw) throw new Error("Media unavailable");
     const message = toMessage(raw);
@@ -725,13 +723,10 @@ export class WhatsApp implements Sender {
       }
       chunks.push(chunk);
     }
-    const { attachmentSchema } = await import("./store.js");
-    if (this.store.message(parsed.messageId).deleted)
-      throw new Error("Deleted");
-    this.store.saveMedia(
-      attachmentSchema.parse(this.store.get("attachment", id)),
-      Buffer.concat(chunks),
-    );
+    const current = this.store.attachments.get(id);
+    if (!current || this.store.message(parsed.messageId).deleted)
+      throw new BridgeError("media_unavailable");
+    this.store.attachments.save(current, Buffer.concat(chunks));
   }
   async send(draft: Draft) {
     if (!this.socket || !this.connected) throw new Error("Offline");
@@ -748,7 +743,7 @@ export class WhatsApp implements Sender {
     const aid = draft.input.attachment_ids[0];
     let content;
     if (aid) {
-      const { meta, data } = this.store.media(aid);
+      const { meta, data } = this.store.attachments.read(aid);
       content =
         meta.mime === "image/png" || meta.mime === "image/jpeg"
           ? { image: data, caption: draft.input.text, mentions }

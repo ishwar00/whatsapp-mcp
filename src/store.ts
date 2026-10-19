@@ -1,15 +1,7 @@
+import { MediaStore } from "./media.js";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
-import {
-  mkdirSync,
-  chmodSync,
-  writeFileSync,
-  readFileSync,
-  unlinkSync,
-  existsSync,
-  statSync,
-  readdirSync,
-} from "node:fs";
+import { mkdirSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { BufferJSON } from "@whiskeysockets/baileys";
@@ -35,33 +27,28 @@ export const chatSchema = z.object({
   updatedAt: z.string(),
 });
 export type Chat = z.infer<typeof chatSchema>;
-export const attachmentSchema = z.object({
-  id: z.string(),
-  chatId: z.string(),
-  messageId: z.string().nullable(),
-  name: z.string(),
-  mime: z.string(),
-  digest: z.string().nullable(),
-  size: z.number(),
-  availability: z.enum(["pending", "stored", "unavailable"]),
-});
-export type Attachment = z.infer<typeof attachmentSchema>;
 const rowSchema = z.object({ value: z.string() });
 export class Store {
   db: DatabaseSync;
   private closed = false;
+  attachments: MediaStore;
   constructor(public dir: string) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
-    mkdirSync(join(dir, "media"), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(join(dir, "bridge.sqlite"));
     chmodSync(join(dir, "bridge.sqlite"), 0o600);
     this.db
-      .exec(`PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
+      .exec(`PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS objects(kind TEXT NOT NULL,id TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(kind,id));
     CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,chat TEXT NOT NULL,observed TEXT NOT NULL,sent TEXT,value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat,observed,id);
     CREATE TABLE IF NOT EXISTS requests(client TEXT,request TEXT,digest TEXT,draft TEXT,PRIMARY KEY(client,request));`);
+    try {
+      this.attachments = new MediaStore(this.db, dir);
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
     this.db.function("contains_text", { deterministic: true }, (text, query) =>
       String(text ?? "")
         .toLocaleLowerCase()
@@ -175,7 +162,6 @@ export class Store {
         "identity_conflict",
         "Conflicting verified identity mapping",
       );
-    const removedFiles = new Set<string>();
     this.transaction(() => {
       this.db
         .prepare(
@@ -252,10 +238,18 @@ export class Store {
           ? null
           : ([latest.attachmentId, keep.attachmentId, m.attachmentId].find(
               (aid) =>
-                aid &&
-                attachmentSchema.safeParse(this.get("attachment", aid)).data
-                  ?.availability === "stored",
+                aid && this.attachments.get(aid)?.availability === "stored",
             ) ?? latest.attachmentId);
+        if (latest.deleted)
+          this.db
+            .prepare("DELETE FROM attachments WHERE message_id IN (?,?)")
+            .run(keep.id, m.id);
+        else
+          this.db
+            .prepare(
+              "UPDATE attachments SET message_id=?,chat_id=? WHERE message_id=?",
+            )
+            .run(keep.id, to, m.id);
         this.writeMessage({
           ...latest,
           id: keep.id,
@@ -268,16 +262,8 @@ export class Store {
           replyId: latest.deleted ? null : latest.replyId,
           updatedAt: new Date().toISOString(),
         });
-        if (latest.deleted) {
-          for (const aid of new Set([keep.attachmentId, m.attachmentId])) {
-            if (!aid) continue;
-            removedFiles.add(aid);
-            this.remove("attachment", aid);
-          }
-        }
         const raw = this.get("raw", latest.id);
-        if (latest.deleted) this.remove("raw", keep.id);
-        else if (raw) this.put("raw", keep.id, raw);
+        if (!latest.deleted && raw) this.put("raw", keep.id, raw);
         this.db.prepare("DELETE FROM messages WHERE id=?").run(m.id);
         this.remove("raw", m.id);
         this.put("message-alias", m.id, keep.id);
@@ -288,29 +274,11 @@ export class Store {
         const m = messageSchema.parse(JSON.parse(rowSchema.parse(row).value));
         this.aliasMessageKeys(m, [lid, pn]);
       }
-      // References in immutable drafts remain unchanged and resolve through these aliases.
-      for (const value of this.all("attachment")) {
-        const meta = attachmentSchema.parse(value);
-        if (
-          meta.chatId === from ||
-          (meta.messageId &&
-            this.resolveId("message-alias", meta.messageId) !== meta.messageId)
-        )
-          this.put("attachment", meta.id, {
-            ...meta,
-            chatId: meta.chatId === from ? to : meta.chatId,
-            messageId: meta.messageId
-              ? this.resolveId("message-alias", meta.messageId)
-              : null,
-          });
-      }
+      this.db
+        .prepare("UPDATE attachments SET chat_id=? WHERE chat_id=?")
+        .run(to, from);
       this.remove("chat", from);
     });
-    for (const aid of removedFiles) {
-      try {
-        unlinkSync(join(this.dir, "media", aid));
-      } catch {}
-    }
   }
   chat(id: string) {
     const value = this.get("chat", this.chatId(id));
@@ -664,22 +632,6 @@ export class Store {
     id = this.resolveId("message-alias", id);
     try {
       const m = this.message(id);
-      const attachments = this.db
-        .prepare(
-          "SELECT value FROM objects WHERE kind='attachment' AND (json_extract(value,'$.messageId')=? OR json_extract(value,'$.messageId') IN (SELECT id FROM objects WHERE kind='message-alias' AND value=?))",
-        )
-        .all(m.id, JSON.stringify(m.id))
-        .map(
-          (row) =>
-            attachmentSchema.parse(JSON.parse(rowSchema.parse(row).value)).id,
-        );
-      if (m.attachmentId) attachments.push(m.attachmentId);
-      for (const aid of new Set(attachments)) {
-        try {
-          unlinkSync(join(this.dir, "media", aid));
-        } catch {}
-        this.remove("attachment", aid);
-      }
       this.saveMessage({
         ...m,
         updatedAt: new Date().toISOString(),
@@ -689,37 +641,9 @@ export class Store {
         replyId: null,
         attachmentId: null,
       });
-      this.remove("raw", id);
     } catch (e) {
       if (!(e instanceof BridgeError)) throw e;
     }
-  }
-  saveMedia(meta: Attachment, data: Buffer) {
-    if (data.length > 5 * 1024 * 1024) throw new BridgeError("media_too_large");
-    const used = readdirSync(join(this.dir, "media")).reduce(
-      (sum, name) => sum + statSync(join(this.dir, "media", name)).size,
-      0,
-    );
-    if (used + data.length > 512 * 1024 * 1024)
-      throw new BridgeError("storage_quota_exceeded");
-    writeFileSync(join(this.dir, "media", meta.id), data, { mode: 0o600 });
-    this.put("attachment", meta.id, {
-      ...meta,
-      size: data.length,
-      digest: hash(data),
-      availability: "stored",
-    });
-  }
-  media(id: string) {
-    const meta = attachmentSchema.parse(this.get("attachment", id));
-    if (
-      meta.availability !== "stored" ||
-      !existsSync(join(this.dir, "media", id))
-    )
-      throw new BridgeError("media_unavailable");
-    const data = readFileSync(join(this.dir, "media", id));
-    if (hash(data) !== meta.digest) throw new BridgeError("media_unavailable");
-    return { meta, data };
   }
   drafts() {
     return this.all("draft").map((v) => draftSchema.parse(v));

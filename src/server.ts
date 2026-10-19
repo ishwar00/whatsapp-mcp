@@ -6,22 +6,17 @@ import express, {
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
-import QRCode from "qrcode";
 import { Service } from "./service.js";
 import { BridgeError } from "./domain.js";
 import { createMcp } from "./mcp.js";
 import type { WhatsApp } from "./whatsapp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-function optional<T>(fn: () => T): T | null {
-  try {
-    return fn();
-  } catch {
-    return null;
-  }
-}
 const secret = () => randomBytes(32).toString("base64url");
-const equal = (a: string, b: string) =>
-  a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const equal = (a: string, b: string) => {
+  const left = Buffer.from(a),
+    right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
+};
 export function createApp(
   service: Service,
   wa: WhatsApp,
@@ -31,7 +26,6 @@ export function createApp(
   const app = express();
   app.disable("x-powered-by");
   const base = `http://127.0.0.1:${port}`;
-  const sessions = new Map<string, { csrf: string; expires: number }>();
   app.use((req, res, next) => {
     if (
       req.headers.host !== `127.0.0.1:${port}` &&
@@ -171,77 +165,15 @@ export function createApp(
       next(e);
     }
   });
-  app.post("/owner/login", (req, res) => {
-    const input = z.object({ token: z.string() }).safeParse(req.body);
-    if (!input.success || !equal(input.data.token, ownerToken)) {
-      res.sendStatus(401);
-      return;
-    }
-    for (const [key, v] of sessions)
-      if (v.expires < Date.now()) sessions.delete(key);
-    if (sessions.size >= 20) sessions.clear();
-    const id = secret(),
-      csrf = secret();
-    sessions.set(id, { csrf, expires: Date.now() + 8 * 3600000 });
-    res.setHeader(
-      "Set-Cookie",
-      `owner=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
-    );
-    res.json({ csrf });
-  });
   app.use("/owner", (req, res, next) => {
-    const cookie = req.headers.cookie
-      ?.split(";")
-      .map((c) => c.trim())
-      .find((c) => c.startsWith("owner="))
-      ?.slice(6);
-    const session = cookie ? sessions.get(cookie) : undefined;
-    if (!session || session.expires < Date.now()) {
+    if (!equal(req.headers.authorization ?? "", `Bearer ${ownerToken}`)) {
       res.sendStatus(401);
       return;
     }
-    if (
-      req.method !== "GET" &&
-      (!req.headers.origin ||
-        !equal(String(req.headers["x-csrf-token"] ?? ""), session.csrf))
-    ) {
-      res.sendStatus(403);
-      return;
-    }
-    res.locals.csrf = session.csrf;
     next();
   });
   app.get("/owner/pairing", (_req, res) => {
     res.json({ state: wa.state, qr: wa.qr });
-  });
-  app.get("/owner/state", async (_req, res) => {
-    res.json({
-      csrf: res.locals.csrf,
-      state: wa.state,
-      qr: wa.qr ? await QRCode.toDataURL(wa.qr) : null,
-      chats: service.store.chats().map(({ jid, ...c }) => c),
-      clients: service.store.clients().map(({ tokenHash, ...c }) => c),
-      drafts: service.store.drafts().map((d) => ({
-        ...d,
-        chatName: service.store.chat(d.input.chat_id).name,
-        recipient: service.store.chat(d.input.chat_id).jid,
-        reply: optional(() =>
-          d.input.reply_to_message_id
-            ? service.store.message(d.input.reply_to_message_id)
-            : null,
-        ),
-        mentions: d.input.mention_ids.map((id) =>
-          service.store.get("participant", id),
-        ),
-        attachments: d.input.attachment_ids
-          .map((id) => optional(() => service.store.media(id).meta))
-          .filter(Boolean),
-        context: service.store
-          .messages([d.input.chat_id])
-          .filter((m) => m.observedAt > d.createdAt)
-          .slice(-10),
-      })),
-    });
   });
   app.post("/owner/history", async (req, res) => {
     const input = z
@@ -300,25 +232,6 @@ export function createApp(
     if (!client) throw new BridgeError("not_found_or_not_permitted");
     service.store.put("client", client.id, { ...client, enabled: false });
     res.json({ ok: true });
-  });
-  app.post("/owner/reject", (req, res) => {
-    const q = z.object({ draft_id: z.string() }).parse(req.body);
-    const draft = service.store.draft(q.draft_id);
-    if (draft.status === "pending")
-      service.store.saveDraft({ ...draft, status: "rejected" });
-    res.json({ ok: true });
-  });
-  app.get("/owner/media/:id", (req, res) => {
-    const id = z
-      .string()
-      .regex(/^attachment_[a-zA-Z0-9-]+$/)
-      .parse(req.params.id);
-    const { meta, data } = service.store.media(id);
-    res.setHeader(
-      "Content-Disposition",
-      `attachment; filename="${meta.name.replace(/[^a-zA-Z0-9._-]/g, "_")}"`,
-    );
-    res.type(meta.mime).send(data);
   });
   app.use(
     (error: unknown, _req: Request, res: Response, _next: NextFunction) => {

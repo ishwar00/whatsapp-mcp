@@ -182,7 +182,7 @@ export function createMcp(
         if (q.representation === "metadata") return json(meta);
         if (meta.availability !== "stored") await wa.download(meta.id);
         meta = service.attachment(principal, meta.id);
-        const { data } = service.store.media(meta.id);
+        const { data } = service.store.attachments.read(meta.id);
         if (q.representation === "image") {
           if (!["image/png", "image/jpeg", "image/webp"].includes(meta.mime))
             throw new BridgeError(
@@ -230,7 +230,7 @@ export function createMcp(
       return {
         ...draft,
         attachment_names: draft.input.attachment_ids.map(
-          (aid) => service.store.media(aid).meta.name,
+          (aid) => service.store.attachments.read(aid).meta.name,
         ),
       };
     },

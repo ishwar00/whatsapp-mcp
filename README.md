@@ -167,7 +167,7 @@ Search remains a case-insensitive literal substring search, including Unicode.
 - Stop the server before `npm run owner -- backup /absolute/private/backup`.
   Never start a copied paired session alongside the original.
 - Message content expires after 90 days; tombstones prevent stale history from
-  restoring it. Deleted messages lose all linked attachment copies.
+  restoring it. Message foreign keys and deletion triggers govern all attachment copies.
 - Media storage is limited to 512 MiB. No view-once archiving.
 - The HTTP server binds to loopback. Remote hosting and multi-user operation are
   outside this project's current setup.
@@ -187,3 +187,23 @@ and real delivery depend on a live WhatsApp account. Baileys is pinned; upgrade 
 with linked-device protocol testing.
 
 MIT licensed. See [MCP contract](docs/mcp-contract.md).
+
+## Storage and migrations
+
+Messages, attachment metadata, and attachment bytes live in one SQLite database.
+Inline draft creation and its attachment commit or roll back together. Media quotas
+count stored bytes in SQLite; updating an attachment replaces its quota usage.
+Owner terminal commands authenticate with the local owner bearer key. There are no
+browser login cookies, CSRF sessions, or browser review routes.
+
+On first startup after upgrading from file-based media, the server imports each
+legacy attachment into SQLite, verifies its digest and size, and commits the whole
+import before removing the legacy `media/` directory. Corrupt files abort the import
+and leave source files intact. Missing legacy files become unavailable records.
+Existing IDs, draft payloads, agent keys and WhatsApp credentials are retained.
+Legacy attachments whose message is missing retain their bytes with no message link.
+Backups now need only `bridge.sqlite`. The backup command opens the source
+database read-only and never migrates it; if a legacy media directory exists, it
+copies that too. Before upgrading, stop the server and run the backup command.
+The first import temporarily needs space for legacy files, SQLite, and its WAL. To downgrade, stop the service and
+restore that whole pre-migration backup before running the old version.

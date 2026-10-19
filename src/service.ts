@@ -7,7 +7,7 @@ import {
   type DraftInput,
   type Principal,
 } from "./domain.js";
-import { Store, hash, attachmentSchema } from "./store.js";
+import { Store, hash } from "./store.js";
 export interface Sender {
   connected: boolean;
   ownerIds: string[];
@@ -108,10 +108,9 @@ export class Service {
   }
   attachment(p: Principal, id: string) {
     this.store.expire();
-    const meta = attachmentSchema.parse(this.store.get("attachment", id));
+    const meta = this.store.attachments.get(id);
+    if (!meta) throw new BridgeError("media_unavailable");
     this.store.authorize(p, meta.chatId);
-    if (meta.messageId && this.store.message(meta.messageId).deleted)
-      throw new BridgeError("media_unavailable");
     return meta;
   }
   createDraft(p: Principal, input: unknown) {
@@ -140,7 +139,7 @@ export class Service {
         if (!bytes.length || bytes.length > 5 * 1024 * 1024)
           throw new BridgeError("media_too_large");
         const aid = this.store.uuid("attachment");
-        this.store.saveMedia(
+        this.store.attachments.save(
           {
             id: aid,
             chatId: payload.chat_id,
@@ -157,7 +156,7 @@ export class Service {
         delete normalized.attachment;
       }
       const frozenAttachments = normalized.attachment_ids.map(
-        (aid) => this.store.media(aid).meta.digest,
+        (aid) => this.store.attachments.read(aid).meta.digest,
       );
       const draft: Draft = {
         id,
@@ -195,7 +194,7 @@ export class Service {
         throw new BridgeError("not_found_or_not_permitted");
     for (const aid of input.attachment_ids) {
       this.attachment(p, aid);
-      this.store.media(aid);
+      this.store.attachments.read(aid);
     }
   }
   ownDraft(p: Principal, id: string) {
@@ -226,7 +225,7 @@ export class Service {
       throw new BridgeError("not_found_or_not_permitted");
     const draft = this.ownDraft(p, id);
     const actualNames = draft.input.attachment_ids.map(
-      (aid) => this.store.media(aid).meta.name,
+      (aid) => this.store.attachments.read(aid).meta.name,
     );
     if (JSON.stringify(actualNames) !== JSON.stringify(attachmentNames))
       throw new BridgeError(
@@ -257,7 +256,7 @@ export class Service {
       JSON.stringify(draft.input) +
         JSON.stringify(
           draft.input.attachment_ids.map(
-            (aid) => this.store.media(aid).meta.digest,
+            (aid) => this.store.attachments.read(aid).meta.digest,
           ),
         ),
     );

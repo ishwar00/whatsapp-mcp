@@ -12,3 +12,5 @@ scripts/
 docs/*
 !docs/mcp-contract.md
 .DS_Store
+!docs/design.md
+!docs/implementation-plan.md

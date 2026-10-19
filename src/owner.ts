@@ -1,12 +1,11 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { randomBytes } from "node:crypto";
-import { backup } from "node:sqlite";
+import { DatabaseSync, backup } from "node:sqlite";
 import lockfile from "proper-lockfile";
 import { z } from "zod";
 import QRCode from "qrcode";
 import { setTimeout as delay } from "node:timers/promises";
-import { Store } from "./store.js";
 process.umask(0o077);
 const dir = resolve(process.env.BRIDGE_DATA_DIR || ".data");
 const command = process.argv[2];
@@ -19,22 +18,8 @@ if (command === "init") {
 } else if (command === "pair" || command === "status" || command === "key") {
   const base = `http://127.0.0.1:${process.env.BRIDGE_PORT || 3210}`;
   const token = readFileSync(join(dir, "owner-key"), "utf8").trim();
-  const login = await fetch(`${base}/owner/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
-  if (!login.ok)
-    throw new Error(
-      "Could not authenticate to the local server. Start npm start with the same BRIDGE_DATA_DIR.",
-    );
-  const { csrf } = z.object({ csrf: z.string() }).parse(await login.json());
-  const cookie = login.headers.get("set-cookie")?.split(";")[0];
-  if (!cookie) throw new Error("Local owner session was not created");
   const headers = {
-    Cookie: cookie,
-    Origin: base,
-    "x-csrf-token": csrf,
+    Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
   };
   if (command === "key") {
@@ -98,13 +83,18 @@ if (command === "init") {
     );
   const release = await lockfile.lock(dir, { realpath: false, retries: 0 });
   try {
-    const store = new Store(dir);
-    const dest = resolve(target);
-    mkdirSync(dest, { recursive: true, mode: 0o700 });
-    await backup(store.db, join(dest, "bridge.sqlite"));
-    const { cpSync } = await import("node:fs");
-    cpSync(join(dir, "media"), join(dest, "media"), { recursive: true });
-    store.close();
+    const db = new DatabaseSync(join(dir, "bridge.sqlite"), { readOnly: true });
+    try {
+      const dest = resolve(target);
+      mkdirSync(dest, { recursive: true, mode: 0o700 });
+      await backup(db, join(dest, "bridge.sqlite"));
+      if (existsSync(join(dir, "media"))) {
+        const { cpSync } = await import("node:fs");
+        cpSync(join(dir, "media"), join(dest, "media"), { recursive: true });
+      }
+    } finally {
+      db.close();
+    }
     process.stdout.write(
       "Backup created. Keep it private. Stop the service before restoring.\n",
     );

@@ -105,7 +105,7 @@ test("late identity merge deduplicates, preserves edits, files, quotes and immut
       editedAt: "2026-10-18T00:00:00Z",
     });
     const aid = "file";
-    f.store.saveMedia(
+    f.store.attachments.save(
       {
         id: aid,
         chatId: oldChat,
@@ -137,8 +137,11 @@ test("late identity merge deduplicates, preserves edits, files, quotes and immut
     assert.equal(f.store.message(oldId).id, keep);
     assert.equal(f.store.message(oldId).text, "new edit");
     assert.equal(f.store.message(oldId).attachmentId, aid);
-    assert.equal(f.store.media(aid).data.toString(), "original file bytes");
-    assert.equal(f.store.media(aid).meta.messageId, keep);
+    assert.equal(
+      f.store.attachments.read(aid).data.toString(),
+      "original file bytes",
+    );
+    assert.equal(f.store.attachments.read(aid).meta.messageId, keep);
     assert.equal(JSON.stringify(f.store.draft(draft.id)), frozen);
     assert.equal(f.service.context(f.p, oldChat, oldId).messages[0]?.id, keep);
     f.service.validateReferences(f.p, draft.input);
@@ -177,7 +180,7 @@ test("deletion wins over duplicate edits and removes retained duplicate media", 
     f.ingest(lid, "same", "deleted");
     f.ingest(pn, "same", "stale copy");
     const id = f.store.messageId(pn, "same");
-    f.store.saveMedia(
+    f.store.attachments.save(
       {
         id: "dup-file",
         chatId: opaque("chat", pn),
@@ -197,7 +200,7 @@ test("deletion wins over duplicate edits and removes retained duplicate media", 
     assert.equal(f.store.message(old).deleted, true);
     assert.equal(f.store.message(old).text, "");
     assert.equal(f.store.get("raw", id), undefined);
-    assert.equal(f.store.get("attachment", "dup-file"), undefined);
+    assert.equal(f.store.attachments.get("dup-file"), undefined);
     f.ingest(pn, "same", "resurrection");
     assert.equal(f.store.message(id).deleted, true);
   } finally {
@@ -371,7 +374,7 @@ test("deletion after merging removes every attachment copy and blocks stale meta
     ] as const) {
       f.ingest(jid, "same", "file");
       const id = f.store.messageId(jid, "same");
-      f.store.saveMedia(
+      f.store.attachments.save(
         {
           id: aid,
           chatId: opaque("chat", jid),
@@ -388,34 +391,64 @@ test("deletion after merging removes every attachment copy and blocks stale meta
     }
     const old = f.store.messageId(lid, "same");
     f.store.addAlias(lid, pn);
-    assert.equal(f.store.media("lid-file").data.length, 5);
-    assert.equal(f.store.media("pn-file").data.length, 5);
+    assert.equal(f.store.attachments.read("lid-file").data.length, 5);
+    assert.equal(f.store.attachments.read("pn-file").data.length, 5);
     f.store.eraseMessage(old);
     for (const aid of ["lid-file", "pn-file"]) {
-      assert.equal(f.store.get("attachment", aid), undefined);
+      assert.equal(f.store.attachments.get(aid), undefined);
       assert.throws(() => f.service.attachment(f.p, aid));
-      assert.throws(() => f.store.media(aid));
+      assert.throws(() => f.store.attachments.read(aid));
     }
-    // Stale metadata from a pre-fix database must not make deleted media readable.
-    f.store.saveMedia(
+    // The database now rejects stale metadata instead of letting it become readable.
+    assert.throws(
+      () =>
+        f.store.attachments.save(
+          {
+            id: "stale",
+            chatId: opaque("chat", pn),
+            messageId: f.store.messageId(pn, "same"),
+            name: "old.pdf",
+            mime: "application/pdf",
+            digest: null,
+            size: 0,
+            availability: "pending",
+          },
+          Buffer.from("stale"),
+        ),
+      /message_deleted/,
+    );
+    assert.equal(f.store.attachments.get("stale"), undefined);
+  } finally {
+    f.close();
+  }
+});
+test("merging a live duplicate into an already deleted canonical message removes its bytes", () => {
+  const f = setup();
+  try {
+    f.ingest(lid, "same", "live copy");
+    f.ingest(pn, "same", "will be deleted");
+    const lidId = f.store.messageId(lid, "same");
+    f.store.attachments.save(
       {
-        id: "stale",
-        chatId: opaque("chat", pn),
-        messageId: old,
-        name: "old.pdf",
-        mime: "application/pdf",
+        id: "duplicate",
+        chatId: opaque("chat", lid),
+        messageId: lidId,
+        name: "file",
+        mime: "text/plain",
         digest: null,
         size: 0,
         availability: "pending",
       },
-      Buffer.from("stale"),
+      Buffer.from("bytes"),
     );
-    assert.throws(
-      () => f.service.attachment(f.p, "stale"),
-      /media_unavailable/,
-    );
-    f.store.eraseMessage(old);
-    assert.equal(f.store.get("attachment", "stale"), undefined);
+    f.store.saveMessage({
+      ...f.store.message(lidId),
+      attachmentId: "duplicate",
+    });
+    f.store.eraseMessage(f.store.messageId(pn, "same"));
+    f.store.addAlias(lid, pn);
+    assert.equal(f.store.message(lidId).deleted, true);
+    assert.equal(f.store.attachments.get("duplicate"), undefined);
   } finally {
     f.close();
   }

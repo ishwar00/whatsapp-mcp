@@ -198,7 +198,7 @@ test("uncertain send is persistent and cannot be retried; interrupted attempt re
     f.close();
   }
 });
-test("owner approval rechecks client revocation, scope, reference and attachment digest", async () => {
+test("sending rechecks client revocation, references and attachment digest", async () => {
   const f = fixture();
   try {
     const d = f.service.createDraft(f.p, {
@@ -216,7 +216,9 @@ test("owner approval rechecks client revocation, scope, reference and attachment
 test("attachment forwarding stays in scope; deleting a message destroys bytes and prevents resurrection", () => {
   const f = fixture();
   try {
-    f.store.saveMedia(
+    const m = f.makeMessage("m", { attachmentId: "attachment_x" });
+    f.store.saveMessage(m);
+    f.store.attachments.save(
       {
         id: "attachment_x",
         chatId: f.a.id,
@@ -229,14 +231,12 @@ test("attachment forwarding stays in scope; deleting a message destroys bytes an
       },
       Buffer.from("secret"),
     );
-    const m = f.makeMessage("m", { attachmentId: "attachment_x" });
-    f.store.saveMessage(m);
     f.store.put("raw", "m", { conversation: "secret" });
     f.store.put("client", f.p.id, { ...f.p, enabled: false });
     assert.throws(() => f.service.attachment(f.p, "attachment_x"));
     f.store.put("client", f.p.id, f.p);
     f.store.eraseMessage("m");
-    assert.throws(() => f.store.media("attachment_x"));
+    assert.throws(() => f.store.attachments.read("attachment_x"));
     assert.equal(f.store.get("raw", "m"), undefined);
     f.store.saveMessage(m);
     assert.equal(f.store.message("m").deleted, true);
@@ -292,7 +292,7 @@ test("draft schema rejects arbitrary paths, approval flags, and empty messages",
     false,
   );
 });
-test("real Streamable HTTP client, owner sessions, origin/host checks and CSRF", async () => {
+test("real Streamable HTTP client, owner bearer authentication and origin/host checks", async () => {
   const f = fixture();
   const wa = new WhatsApp(f.store);
   const port = 33219;
@@ -351,45 +351,21 @@ test("real Streamable HTTP client, owner sessions, origin/host checks and CSRF",
     });
     assert.equal(draftResult.isError, undefined);
     assert.equal(f.sends(), 0);
-    const login = await fetch(`${base}/owner/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Origin: base },
-      body: JSON.stringify({ token: "owner-key" }),
-    });
-    assert.equal(login.status, 200);
-    const cookie = login.headers.get("set-cookie")?.split(";")[0] || "";
-    const session = await login.json();
-    const draft = f.store.drafts()[0];
-    assert.ok(draft);
-    const body = JSON.stringify({ draft_id: draft.id, digest: draft.digest });
     assert.equal(
       (
-        await fetch(`${base}/owner/approve`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Cookie: cookie,
-            Origin: base,
-          },
-          body,
+        await fetch(`${base}/owner/pairing`, {
+          headers: { Authorization: "Bearer agent-key" },
         })
       ).status,
-      403,
+      401,
     );
     assert.equal(
       (
-        await fetch(`${base}/owner/approve`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Cookie: cookie,
-            Origin: base,
-            "X-CSRF-Token": session.csrf,
-          },
-          body,
+        await fetch(`${base}/owner/pairing`, {
+          headers: { Authorization: "Bearer owner-key" },
         })
       ).status,
-      404,
+      200,
     );
     assert.equal(f.sends(), 0);
     const pending = f.service.createDraft(f.p, {
@@ -400,9 +376,8 @@ test("real Streamable HTTP client, owner sessions, origin/host checks and CSRF",
     const originalHash = f.store.clients()[0]?.tokenHash;
     const headers = {
       "Content-Type": "application/json",
-      Cookie: cookie,
+      Authorization: "Bearer owner-key",
       Origin: base,
-      "X-CSRF-Token": session.csrf,
     };
     const editBody = {
       name: "Renamed agent",
@@ -414,13 +389,13 @@ test("real Streamable HTTP client, owner sessions, origin/host checks and CSRF",
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Cookie: cookie,
+            Authorization: "Bearer agent-key",
             Origin: base,
           },
           body: JSON.stringify(editBody),
         })
       ).status,
-      403,
+      401,
     );
     assert.equal(
       (
@@ -1319,8 +1294,8 @@ test("MCP accepts ZIP drafts, exposes filenames for approval, and sends the stor
     assert.match(JSON.stringify(created), /attachment_names/);
     const draft = f.store.drafts()[0]!;
     const aid = draft.input.attachment_ids[0]!;
-    assert.deepEqual(f.store.media(aid).data, bytes);
-    assert.equal(f.store.media(aid).meta.mime, "application/zip");
+    assert.deepEqual(f.store.attachments.read(aid).data, bytes);
+    assert.equal(f.store.attachments.read(aid).meta.mime, "application/zip");
     f.store.put("client", f.p.id, { ...f.p, canSend: true });
     const args = {
       draft_id: draft.id,
