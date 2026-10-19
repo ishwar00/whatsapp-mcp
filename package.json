@@ -1,0 +1,38 @@
+{
+  "name": "whatsapp-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "dev": "node --import tsx src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js",
+    "owner": "node --import tsx src/owner.ts",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "tsc --noEmit",
+    "format": "prettier --write src test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@whiskeysockets/baileys": "7.0.0-rc14",
+    "express": "^5.1.0",
+    "pino": "^9.0.0",
+    "proper-lockfile": "^4.1.2",
+    "qrcode": "^1.5.4",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "@types/qrcode": "^1.5.5",
+    "prettier": "^3.9.9",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0"
+  },
+  "description": "Local WhatsApp MCP server for reading chats, drafting replies, and client-approved sends.",
+  "license": "MIT"
+}

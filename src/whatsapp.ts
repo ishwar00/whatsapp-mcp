@@ -1,0 +1,772 @@
+import makeWASocket, {
+  BufferJSON,
+  Browsers,
+  DisconnectReason,
+  initAuthCreds,
+  proto,
+  downloadMediaMessage,
+  getContentType,
+  normalizeMessageContent,
+  jidNormalizedUser,
+  type AuthenticationState,
+  type SignalDataTypeMap,
+  type WAMessage,
+  type WASocket,
+  type Contact,
+} from "@whiskeysockets/baileys";
+import pino from "pino";
+import { decryptEdit } from "./encrypted-edit.js";
+import { z } from "zod";
+import { Store, opaque } from "./store.js";
+import { BridgeError, messageSchema, type Draft } from "./domain.js";
+import type { Sender } from "./service.js";
+const keyPair = z.object({
+  public: z.instanceof(Uint8Array),
+  private: z.instanceof(Uint8Array),
+});
+const keySchemas = {
+  "lid-mapping": z.string(),
+  "device-list": z.array(z.string()),
+  tctoken: z.object({
+    token: z.instanceof(Buffer),
+    timestamp: z.string().optional(),
+    senderTimestamp: z.number().optional(),
+  }),
+  "identity-key": z.instanceof(Uint8Array),
+  "pre-key": keyPair,
+  session: z.instanceof(Uint8Array),
+  "sender-key": z.instanceof(Uint8Array),
+  "sender-key-memory": z.record(z.boolean()),
+  "app-state-sync-key": z.object({
+    keyData: z.instanceof(Uint8Array).nullish(),
+    fingerprint: z
+      .object({
+        rawId: z.number().nullish(),
+        currentIndex: z.number().nullish(),
+        deviceIndexes: z.array(z.number()).nullish(),
+      })
+      .nullish(),
+    timestamp: z
+      .union([
+        z.number(),
+        z.object({ low: z.number(), high: z.number(), unsigned: z.boolean() }),
+      ])
+      .nullish(),
+  }),
+  "app-state-sync-version": z.object({
+    version: z.number(),
+    hash: z.instanceof(Buffer),
+    indexValueMap: z.record(z.object({ valueMac: z.instanceof(Uint8Array) })),
+  }),
+};
+function toMessage(value: unknown): WAMessage {
+  const message = proto.WebMessageInfo.fromObject(
+    z.record(z.unknown()).parse(value),
+  );
+  const key = z
+    .object({
+      remoteJid: z.string(),
+      id: z.string(),
+      fromMe: z.boolean().nullish(),
+      participant: z.string().nullish(),
+      remoteJidAlt: z.string().optional(),
+      participantAlt: z.string().optional(),
+    })
+    .parse(message.key);
+  return { ...message, key };
+}
+const logger = pino({ level: "silent" });
+const diagnostics = pino({ level: "info" }, pino.destination(2));
+export class WhatsApp implements Sender {
+  connected = false;
+  ownerIds: string[] = [];
+  qr: string | null = null;
+  state = "offline";
+  socket: WASocket | undefined;
+  stopping = false;
+  reconnectAttempt = 0;
+  caching = 0;
+  constructor(public store: Store) {}
+  auth(): AuthenticationState {
+    const saved = this.store.get("auth", "creds");
+    const creds = saved
+      ? JSON.parse(
+          JSON.stringify(saved, BufferJSON.replacer),
+          BufferJSON.reviver,
+        )
+      : initAuthCreds();
+    return {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const result: { [key: string]: SignalDataTypeMap[typeof type] } = {};
+          for (const id of ids) {
+            const value = this.store.get("key", `${type}:${id}`);
+            if (value) {
+              const parsed = keySchemas[type].parse(value);
+              result[id] = (
+                type === "app-state-sync-key"
+                  ? proto.Message.AppStateSyncKeyData.fromObject(
+                      keySchemas["app-state-sync-key"].parse(value),
+                    )
+                  : parsed
+              ) as SignalDataTypeMap[typeof type];
+            }
+          }
+          return result;
+        },
+        set: async (data) => {
+          this.store.transaction(() => {
+            for (const [type, entries] of Object.entries(data)) {
+              for (const [id, value] of Object.entries(entries ?? {})) {
+                if (value) this.store.put("key", `${type}:${id}`, value);
+                else this.store.remove("key", `${type}:${id}`);
+              }
+            }
+          });
+        },
+      },
+    };
+  }
+  saveContact(contact: Partial<Contact>) {
+    if (!contact.id) return;
+    const addresses = [contact.id, contact.lid, contact.phoneNumber]
+      .filter((id): id is string => Boolean(id))
+      .map(jidNormalizedUser);
+    const previous = z
+      .object({
+        savedName: z.string().optional(),
+        profileName: z.string().optional(),
+        name: z.string().optional(),
+      })
+      .safeParse(
+        this.store.get(
+          "participant",
+          opaque("participant", jidNormalizedUser(contact.id)),
+        ),
+      );
+    const savedName =
+      contact.name || (previous.success ? previous.data.savedName : undefined);
+    const profileName =
+      contact.notify ||
+      contact.verifiedName ||
+      (previous.success ? previous.data.profileName : undefined);
+    const name = savedName || profileName;
+    if (
+      (contact.lid || contact.id.endsWith("@lid")) &&
+      (contact.phoneNumber || contact.id.endsWith("@s.whatsapp.net"))
+    )
+      this.store.addAlias(
+        jidNormalizedUser(contact.lid || contact.id),
+        jidNormalizedUser(contact.phoneNumber || contact.id),
+      );
+    for (const jid of addresses) {
+      if (name)
+        this.store.put("participant", opaque("participant", jid), {
+          id: opaque("participant", jid),
+          jid,
+          name,
+          savedName,
+          profileName,
+        });
+      if (!jid.endsWith("@g.us")) this.store.saveChat(jid, name);
+    }
+  }
+  async refreshGroups(sock: Pick<WASocket, "groupFetchAllParticipating">) {
+    const groups = await sock.groupFetchAllParticipating();
+    if (this.stopping || this.socket !== sock) return;
+    for (const group of Object.values(groups))
+      if (group.id) this.store.saveChat(group.id, group.subject);
+  }
+  start() {
+    if (this.stopping) return;
+    const auth = this.auth();
+    const historyMode = this.store.get("setting", "history-mode") === "desktop";
+    diagnostics.info({
+      event: "wa_connect_start",
+      historyMode: historyMode ? "desktop" : "default",
+      registered: auth.creds.registered,
+    });
+    const sock = makeWASocket({
+      auth,
+      logger,
+      markOnlineOnConnect: false,
+      ...(historyMode
+        ? { browser: Browsers.macOS("Desktop"), syncFullHistory: true }
+        : { syncFullHistory: false }),
+      generateHighQualityLinkPreview: false,
+      getMessage: async (key) => {
+        if (!key.remoteJid || !key.id) return undefined;
+        const id = this.store.messageId(key.remoteJid, key.id);
+        const raw = this.store.get("raw", id);
+        if (!raw) return undefined;
+        return proto.WebMessageInfo.fromObject(raw).message ?? undefined;
+      },
+    });
+    this.socket = sock;
+    this.state = "connecting";
+    sock.ev.on("lid-mapping.update", (mapping) => {
+      if (this.socket !== sock || this.stopping) return;
+      this.store.addAlias(
+        jidNormalizedUser(mapping.lid),
+        jidNormalizedUser(mapping.pn),
+      );
+    });
+    sock.ev.on("creds.update", () => {
+      if (this.socket === sock && !this.stopping)
+        this.store.put("auth", "creds", auth.creds);
+    });
+    sock.ev.on("connection.update", (update) => {
+      if (this.socket !== sock || this.stopping) return;
+      if (update.connection)
+        diagnostics.info({ event: "wa_connection", state: update.connection });
+      if (update.qr) this.qr = update.qr;
+      if (update.connection === "open") {
+        this.reconnectAttempt = 0;
+        this.connected = true;
+        this.state = "connected";
+        this.qr = null;
+        for (const chat of this.store.chats()) this.store.saveChat(chat.jid);
+        void this.refreshGroups(sock).catch(() => {
+          process.stderr.write(
+            "Group names could not be refreshed; waiting for metadata updates.\n",
+          );
+        });
+        this.ownerIds = [sock.user?.id, sock.user?.lid]
+          .filter((id): id is string => Boolean(id))
+          .map((id) => opaque("participant", jidNormalizedUser(id)));
+      }
+      if (update.connection === "close") {
+        this.connected = false;
+        this.qr = null;
+        const error = update.lastDisconnect?.error;
+        const status =
+          error && "output" in error
+            ? z.object({ statusCode: z.number() }).safeParse(error.output)
+            : null;
+        diagnostics.warn({
+          event: "wa_disconnect",
+          status: status?.success ? status.data.statusCode : null,
+          reason: error?.message?.slice(0, 200),
+          attempt: this.reconnectAttempt,
+        });
+        const loggedOut =
+          status?.success &&
+          status.data.statusCode === DisconnectReason.loggedOut;
+        this.state = loggedOut ? "reauth_required" : "offline";
+        if (!loggedOut && !this.stopping)
+          setTimeout(
+            () => this.start(),
+            Math.min(60000, 2000 * 2 ** Math.min(this.reconnectAttempt++, 5)) +
+              Math.random() * 1000,
+          ).unref();
+      }
+    });
+    sock.ev.on("chats.upsert", (chats) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const c of chats)
+        if (c.id) this.store.saveChat(c.id, c.name ?? undefined);
+    });
+    sock.ev.on("contacts.upsert", (contacts) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const contact of contacts) this.saveContact(contact);
+    });
+    sock.ev.on("contacts.update", (contacts) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const contact of contacts) this.saveContact(contact);
+    });
+    sock.ev.on("groups.update", (groups) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const group of groups)
+        if (group.id) this.store.saveChat(group.id, group.subject);
+    });
+    sock.ev.on("chats.update", (chats) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const chat of chats)
+        if (chat.id && chat.name) this.store.saveChat(chat.id, chat.name);
+    });
+    sock.ev.on(
+      "messaging-history.set",
+      ({
+        chats,
+        contacts,
+        messages,
+        syncType,
+        isLatest,
+        progress,
+        lidPnMappings,
+      }) => {
+        if (this.socket !== sock || this.stopping) return;
+        diagnostics.info({
+          event: "wa_history_received",
+          syncType,
+          isLatest,
+          progress,
+          chats: chats.length,
+          messages: messages.length,
+          chatIds: [
+            ...new Set(messages.map((m) => m.key.remoteJid).filter(Boolean)),
+          ].map((jid) => opaque("chat", String(jid))),
+        });
+        for (const mapping of lidPnMappings ?? [])
+          this.store.addAlias(mapping.lid, mapping.pn);
+        for (const c of chats)
+          if (c.id) this.store.saveChat(c.id, c.name ?? undefined);
+        for (const contact of contacts) this.saveContact(contact);
+        for (const m of messages) this.ingest(m, "history");
+      },
+    );
+    sock.ev.on("messages.upsert", ({ messages }) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const m of messages) {
+        const protocol = normalizeMessageContent(m.message)?.protocolMessage;
+        if (protocol?.historySyncNotification)
+          diagnostics.info({
+            event: "wa_history_notification",
+            syncType: protocol.historySyncNotification.syncType,
+          });
+        const response = protocol?.peerDataOperationRequestResponseMessage;
+        if (response)
+          diagnostics.info({
+            event: "wa_peer_response",
+            requestType: response.peerDataOperationRequestType,
+            requestId: response.stanzaId,
+            results: response.peerDataOperationResult?.map((r) => ({
+              historyCode:
+                r.fullHistorySyncOnDemandRequestResponse?.responseCode,
+            })),
+          });
+        this.ingest(m, "live");
+      }
+    });
+    sock.ev.on("messages.update", (updates) => {
+      if (this.socket !== sock || this.stopping) return;
+      for (const { key, update } of updates) {
+        if (!key.remoteJid || !key.id) continue;
+        const id = this.store.messageId(key.remoteJid, key.id);
+        if (
+          update.message === null ||
+          update.messageStubType === proto.WebMessageInfo.StubType.REVOKE
+        )
+          this.store.eraseMessage(id);
+        else if (update.message) {
+          const raw = this.store.get("raw", id);
+          const previous = raw ? proto.WebMessageInfo.fromObject(raw) : { key };
+          this.ingest({ ...previous, ...update, key }, "live");
+        }
+      }
+    });
+    sock.ev.on("messages.delete", (event) => {
+      if (this.socket !== sock || this.stopping) return;
+      if ("keys" in event) {
+        for (const key of event.keys)
+          if (key.remoteJid && key.id)
+            this.store.eraseMessage(
+              this.store.messageId(key.remoteJid, key.id),
+            );
+      } else {
+        const chat = opaque("chat", event.jid);
+        for (const m of this.store.messages([chat]))
+          this.store.eraseMessage(m.id);
+      }
+    });
+  }
+  async requestHistory(chatId: string, count: number) {
+    if (!this.connected || !this.socket)
+      throw new BridgeError("service_offline");
+    const chat = this.store.chat(chatId);
+    const oldest = this.store
+      .messages([chatId])
+      .filter((m) => m.sentAt && !m.deleted)
+      .sort((a, b) => a.sentAt!.localeCompare(b.sentAt!))[0];
+    const value = oldest && this.store.get("raw", oldest.id);
+    const anchor = value ? toMessage(value) : undefined;
+    const requestId = await this.socket.fetchMessageHistory(
+      count,
+      anchor?.key ?? { remoteJid: chat.jid, fromMe: false },
+      anchor?.messageTimestamp
+        ? Number(anchor.messageTimestamp) * 1000
+        : Date.now(),
+    );
+    diagnostics.info({
+      event: "wa_history_requested",
+      chatId,
+      count,
+      anchored: Boolean(anchor),
+      requestId,
+    });
+    return {
+      requestId,
+      anchored: Boolean(anchor),
+      status: "requested",
+      note: "Request submitted; only a history event confirms receipt.",
+    };
+  }
+  repairHistoricalSenders() {
+    for (const row of this.store.db
+      .prepare(
+        "SELECT value FROM messages WHERE json_extract(value,'$.direction')='incoming' AND json_extract(value,'$.source')='history'",
+      )
+      .all()) {
+      const value = z.object({ value: z.string() }).parse(row).value;
+      const message = messageSchema.parse(JSON.parse(value));
+      const raw = this.store.get("raw", message.id);
+      if (!raw) continue;
+      const original = toMessage(raw);
+      if (!original.key.remoteJid?.endsWith("@g.us")) continue;
+      const sender = original.key.participant || original.participant;
+      if (!sender) continue;
+      const jid = this.store.canonicalJid(jidNormalizedUser(sender));
+      const senderId = opaque("participant", jid);
+      if (senderId === message.senderId) continue;
+      const name = z
+        .object({ name: z.string() })
+        .safeParse(this.store.get("participant", senderId));
+      this.store.repairSender(
+        message.id,
+        senderId,
+        name.success ? name.data.name : original.pushName || jid.split("@")[0]!,
+      );
+    }
+  }
+  replayEncryptedEdits() {
+    for (const value of this.store.all("raw")) {
+      const raw = toMessage(value);
+      if (normalizeMessageContent(raw.message)?.secretEncryptedMessage)
+        this.ingest(raw, "live");
+    }
+  }
+  restoreReactions() {
+    for (const message of this.store.messages(
+      this.store.chats().map((c) => c.id),
+    )) {
+      if (message.contentType !== "reaction" || message.deleted) continue;
+      const value = this.store.get("raw", message.id);
+      if (!value) continue;
+      const raw = toMessage(value);
+      const reaction = normalizeMessageContent(raw.message)?.reactionMessage;
+      if (!reaction) continue;
+      const replyId =
+        reaction.key?.id && raw.key.remoteJid
+          ? opaque(
+              "message",
+              `${reaction.key.remoteJid || raw.key.remoteJid}:${reaction.key.id}`,
+            )
+          : null;
+      const text = reaction.text ?? "";
+      if (message.text === text && message.replyId === replyId) continue;
+      this.store.saveMessage({
+        ...message,
+        text,
+        replyId,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+  ingest(raw: WAMessage, source: "live" | "history", editTime?: string) {
+    const timestamp = Number(raw.messageTimestamp || 0);
+    const eventTime =
+      timestamp > 0 && timestamp < 8640000000000 && Number.isFinite(timestamp)
+        ? new Date(timestamp * 1000).toISOString()
+        : null;
+    const editedAt =
+      editTime ??
+      (raw.message?.editedMessage
+        ? (eventTime ?? new Date().toISOString())
+        : null);
+    const jid = raw.key.remoteJid;
+    if (!jid || !raw.key.id || jid === "status@broadcast") return;
+    for (const [address, alt] of [
+      [jid, raw.key.remoteJidAlt],
+      [raw.key.participant || raw.participant, raw.key.participantAlt],
+    ]) {
+      if (address?.endsWith("@lid") && alt?.endsWith("@s.whatsapp.net"))
+        this.store.addAlias(jidNormalizedUser(address), jidNormalizedUser(alt));
+      else if (alt?.endsWith("@lid") && address?.endsWith("@s.whatsapp.net"))
+        this.store.addAlias(jidNormalizedUser(alt), jidNormalizedUser(address));
+    }
+    if (!raw.key.fromMe && !jid.endsWith("@g.us") && raw.pushName)
+      this.saveContact({ id: jid, notify: raw.pushName });
+    const chat = this.store.saveChat(jid);
+    const id = this.store.messageId(jid, raw.key.id);
+    if (
+      raw.message?.viewOnceMessage ||
+      raw.message?.viewOnceMessageV2 ||
+      raw.message?.viewOnceMessageV2Extension
+    )
+      return;
+    const content = normalizeMessageContent(raw.message);
+    if (!content) return;
+    if (content.secretEncryptedMessage) {
+      const encrypted = content.secretEncryptedMessage;
+      if (
+        encrypted.secretEncType !==
+        proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT
+      )
+        return;
+      const targetId = encrypted.targetMessageKey?.id;
+      if (!targetId || targetId === raw.key.id) return;
+      const target = this.store.messageId(jid, targetId);
+      const value = this.store.get("raw", target);
+      if (!value) {
+        this.store.put("raw", id, raw);
+        return;
+      }
+      const original = toMessage(value);
+      const decrypted = decryptEdit(
+        original,
+        raw,
+        this.socket?.user?.id,
+        (jid) => this.store.canonicalJid(jid),
+      );
+      if (!decrypted) {
+        this.store.put("raw", id, raw);
+        return;
+      }
+      const protocol = decrypted.protocolMessage;
+      if (
+        protocol &&
+        (protocol.type !== proto.Message.ProtocolMessage.Type.MESSAGE_EDIT ||
+          protocol.key?.id !== targetId)
+      )
+        return;
+      this.ingest(
+        {
+          ...original,
+          message: {
+            ...decrypted,
+            messageContextInfo: original.message?.messageContextInfo,
+          },
+        },
+        source,
+        eventTime ?? new Date().toISOString(),
+      );
+      this.store.removeMessageEvent(id);
+      return;
+    }
+    if (content.protocolMessage) {
+      const protocol = content.protocolMessage;
+      if (
+        protocol.type === proto.Message.ProtocolMessage.Type.REVOKE &&
+        protocol.key?.id
+      )
+        this.store.eraseMessage(this.store.messageId(jid, protocol.key.id));
+      if (protocol.editedMessage && protocol.key?.id)
+        this.ingest(
+          {
+            ...raw,
+            key: { ...raw.key, id: protocol.key.id },
+            message: protocol.editedMessage,
+          },
+          source,
+          protocol.timestampMs && Number(protocol.timestampMs) > 0
+            ? new Date(Number(protocol.timestampMs)).toISOString()
+            : (editedAt ?? eventTime ?? new Date().toISOString()),
+        );
+      return;
+    }
+    const sender = this.store.canonicalJid(
+      jidNormalizedUser(
+        raw.key.fromMe
+          ? this.socket?.user?.id || "owner"
+          : raw.key.participant || raw.participant || jid,
+      ),
+    );
+    const senderId = opaque("participant", sender);
+    const prior = this.store.get("participant", senderId);
+    const name = z.object({ name: z.string() }).safeParse(prior);
+    const senderName =
+      (name.success ? name.data.name : undefined) ||
+      raw.pushName ||
+      (name.success ? name.data.name : sender.split("@")[0] || "Unknown");
+    this.store.put("participant", senderId, {
+      ...(z.record(z.unknown()).safeParse(prior).success
+        ? z.record(z.unknown()).parse(prior)
+        : {}),
+      id: senderId,
+      jid: sender,
+      name: senderName,
+    });
+    const body =
+      content.imageMessage ||
+      content.videoMessage ||
+      content.documentMessage ||
+      content.audioMessage ||
+      content.stickerMessage ||
+      content.extendedTextMessage;
+    const context = body?.contextInfo;
+    const text =
+      content.reactionMessage?.text ??
+      (content.conversation ||
+        content.extendedTextMessage?.text ||
+        content.imageMessage?.caption ||
+        content.videoMessage?.caption ||
+        content.documentMessage?.caption ||
+        "");
+    const type = getContentType(content) || "unsupported";
+    const media =
+      content.imageMessage ||
+      content.videoMessage ||
+      content.documentMessage ||
+      content.audioMessage ||
+      content.stickerMessage;
+    const attachmentId = media ? opaque("attachment", id) : null;
+    const sentAt = editedAt ? null : eventTime;
+    const saved = this.store.saveMessage({
+      editedAt,
+      updatedAt: new Date().toISOString(),
+      id,
+      chatId: chat.id,
+      providerId: raw.key.id,
+      senderId,
+      senderName,
+      direction: raw.key.fromMe ? "outgoing" : "incoming",
+      sentAt,
+      observedAt: new Date().toISOString(),
+      text,
+      contentType:
+        type === "conversation" || type === "extendedTextMessage"
+          ? "text"
+          : type.replace("Message", ""),
+      mentions: (context?.mentionedJid ?? []).map((v) =>
+        opaque("participant", jidNormalizedUser(v)),
+      ),
+      replyId: content.reactionMessage?.key?.id
+        ? this.store.messageId(
+            content.reactionMessage.key.remoteJid || jid,
+            content.reactionMessage.key.id,
+          )
+        : context?.stanzaId
+          ? this.store.messageId(jid, context.stanzaId)
+          : null,
+      deleted: false,
+      source,
+      attachmentId,
+      expiresAt:
+        context?.expiration && sentAt
+          ? new Date(
+              Date.parse(sentAt) + context.expiration * 1000,
+            ).toISOString()
+          : null,
+    });
+    if (!saved || this.store.message(id).deleted) return;
+    const previousRaw = this.store.get("raw", id);
+    const previousMessage = previousRaw
+      ? proto.WebMessageInfo.fromObject(previousRaw)
+      : undefined;
+    const secretContext = previousMessage?.message?.messageContextInfo;
+    this.store.put(
+      "raw",
+      id,
+      editedAt && secretContext
+        ? {
+            ...raw,
+            message: { ...content, messageContextInfo: secretContext },
+          }
+        : raw,
+    );
+    if (media && attachmentId) {
+      const meta = {
+        id: attachmentId,
+        chatId: chat.id,
+        messageId: id,
+        name: content.documentMessage?.fileName || type,
+        mime: media.mimetype || "application/octet-stream",
+        digest: null,
+        size: Number(media.fileLength || 0),
+        availability: "pending",
+      } satisfies import("./store.js").Attachment;
+      if (!this.store.get("attachment", attachmentId))
+        this.store.put("attachment", attachmentId, meta);
+      if (
+        source === "live" &&
+        this.socket &&
+        meta.mime.startsWith("image/") &&
+        meta.size <= 5 * 1024 * 1024 &&
+        this.caching < 2
+      ) {
+        this.caching++;
+        void this.download(attachmentId)
+          .catch(() => {})
+          .finally(() => {
+            this.caching--;
+          });
+      }
+    }
+  }
+  async download(id: string) {
+    const parsed = z
+      .object({ messageId: z.string().nullable(), chatId: z.string() })
+      .parse(this.store.get("attachment", id));
+    if (!parsed.messageId) throw new Error("Media unavailable");
+    const raw = this.store.get("raw", parsed.messageId);
+    if (!raw) throw new Error("Media unavailable");
+    const message = toMessage(raw);
+    const stream = await downloadMediaMessage(
+      message,
+      "stream",
+      { options: { signal: AbortSignal.timeout(20000) } },
+      {
+        logger,
+        reuploadRequest:
+          this.socket?.updateMediaMessage ??
+          (async () => {
+            throw new Error("Offline");
+          }),
+      },
+    );
+    const chunks: Buffer[] = [];
+    let size = 0;
+    for await (const chunk of stream) {
+      size += chunk.length;
+      if (size > 5 * 1024 * 1024) {
+        stream.destroy();
+        throw new Error("media_too_large");
+      }
+      chunks.push(chunk);
+    }
+    const { attachmentSchema } = await import("./store.js");
+    if (this.store.message(parsed.messageId).deleted)
+      throw new Error("Deleted");
+    this.store.saveMedia(
+      attachmentSchema.parse(this.store.get("attachment", id)),
+      Buffer.concat(chunks),
+    );
+  }
+  async send(draft: Draft) {
+    if (!this.socket || !this.connected) throw new Error("Offline");
+    const chat = this.store.chat(draft.input.chat_id);
+    const mentions = draft.input.mention_ids.map(
+      (id) =>
+        z.object({ jid: z.string() }).parse(this.store.get("participant", id))
+          .jid,
+    );
+    const quote = draft.input.reply_to_message_id
+      ? this.store.get("raw", draft.input.reply_to_message_id)
+      : undefined;
+    const options = quote ? { quoted: toMessage(quote) } : {};
+    const aid = draft.input.attachment_ids[0];
+    let content;
+    if (aid) {
+      const { meta, data } = this.store.media(aid);
+      content =
+        meta.mime === "image/png" || meta.mime === "image/jpeg"
+          ? { image: data, caption: draft.input.text, mentions }
+          : {
+              document: data,
+              mimetype: meta.mime,
+              fileName: meta.name,
+              caption: draft.input.text,
+              mentions,
+            };
+    } else content = { text: draft.input.text, mentions };
+    const result = await this.socket.sendMessage(chat.jid, content, options);
+    if (!result?.key.id) throw new Error("No provider acknowledgment");
+    return result.key.id;
+  }
+  stop() {
+    this.stopping = true;
+    this.connected = false;
+    this.socket?.end(undefined);
+  }
+}
