@@ -422,6 +422,11 @@ test("actual production query builder avoids temporary sorts for global, single 
           false,
           plan.join("\n"),
         );
+        if (after)
+          assert.ok(
+            plan.some((line) => line.includes("SEARCH messages USING INDEX")),
+            plan.join("\n"),
+          );
         assert.ok(
           plan.some((line) =>
             line.includes(

@@ -509,12 +509,17 @@ export class Store {
       });
       where.push(`(${choices.join(" OR ") || "0"})`);
     }
-    if (after)
+    if (after) {
+      add(
+        `coalesce(sent,observed) ${q.order === "oldest_first" ? ">=" : "<="} ?`,
+        after.time,
+      );
       add(
         `(coalesce(sent,observed),id) ${q.order === "oldest_first" ? ">" : "<"} (?,?)`,
         after.time,
         after.id,
       );
+    }
     const order = q.order === "oldest_first" ? "ASC" : "DESC";
     // One chat can seek its own time index; multiple/all chats share the global time index.
     const index =

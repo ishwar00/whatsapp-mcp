@@ -21,7 +21,7 @@ flowchart LR
 
 ## Quick start
 
-Requires Node.js **22.13+** and npm. The optional Claude approval hook uses Python 3. Terminal QR pairing works without a browser
+Requires Node.js **22.16+** and npm. The optional Claude approval hook uses Python 3. Terminal QR pairing works without a browser
 review page. Linux and macOS can run the Node server; the optional launchd helper
 is macOS-specific.
 
