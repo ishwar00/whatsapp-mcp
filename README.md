@@ -119,6 +119,30 @@ A stdio adapter is also included for clients that require it. Run
 `node /absolute/path/to/whatsapp-mcp/dist/stdio.js` with `WHATSAPP_BRIDGE_TOKEN` set.
 It connects to the local HTTP server. Set `WHATSAPP_BRIDGE_URL` to change its URL.
 
+## WhatsApp reply skill
+
+The optional [whatsapp-replies skill](skills/whatsapp-replies/SKILL.md) guides agents
+to write conversational replies, keep exact technical values, and choose when to
+split a reply into separate messages. It was tuned to Ishwar's chat voice. Use it
+as a starting point and adapt the voice references to your own messages.
+
+Ask your agent to install `skills/whatsapp-replies` from this repository for your
+client. For a manual installation, run these commands from the repository root:
+
+```sh
+# Claude Code
+mkdir -p ~/.claude/skills/whatsapp-replies
+cp skills/whatsapp-replies/SKILL.md ~/.claude/skills/whatsapp-replies/SKILL.md
+
+# Codex
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills/whatsapp-replies"
+cp skills/whatsapp-replies/SKILL.md "${CODEX_HOME:-$HOME/.codex}/skills/whatsapp-replies/SKILL.md"
+```
+
+Start a new session after installing, then ask the agent to use `whatsapp-replies`
+when drafting a reply. The skill does not configure MCP access or send approval;
+keep the approval policy described above.
+
 ## Tools and sending
 
 | Tools | Purpose |
