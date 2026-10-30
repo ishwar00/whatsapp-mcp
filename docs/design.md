@@ -54,7 +54,18 @@ The owner history endpoint uses the same queue and job format as MCP.
 
 New pairings request full history using the default Chrome profile. Existing
 pairings preserve their saved sync preference. Both sync modes keep the same
-browser identity; WhatsApp controls how much history it shares.
+browser identity; WhatsApp controls how much history it shares. Installation applies
+one pinned Baileys rc14 capability correction: `supportGroupHistory: true` in the
+registration bytes. Otherwise the phone omits messages it imported from shared
+group history. This capability is stored at pairing, so an existing pairing that
+advertised false needs to be linked again. Tests decode the actual registration
+bytes and check the patch is idempotent.
+
+Edited history retains the provider's original sent time, separately from edit
+time. If the base message arrives after an edit, only missing date metadata is
+filled; edited content and its raw payload remain intact. Media refresh normalizes
+historical group sender keys and handles both native HTTP and Boom status codes.
+A phone response of NOT_FOUND leaves the message and attachment metadata available.
 
 ## Access and approval
 

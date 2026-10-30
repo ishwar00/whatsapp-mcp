@@ -13,7 +13,8 @@
     "owner": "node --import tsx src/owner.ts",
     "test": "node --import tsx --test test/*.test.ts",
     "check": "tsc --noEmit",
-    "format": "prettier --write src test"
+    "format": "prettier --write src test",
+    "postinstall": "node scripts/patch-baileys.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

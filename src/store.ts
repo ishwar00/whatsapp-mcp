@@ -632,11 +632,18 @@ export class Store {
           (prior.editedAt &&
             (!message.editedAt ||
               Date.parse(message.editedAt) <= Date.parse(prior.editedAt))))
-      )
+      ) {
+        if (!prior.deleted && !prior.sentAt && message.sentAt)
+          this.writeMessage({
+            ...prior,
+            sentAt: message.sentAt,
+            updatedAt: message.updatedAt,
+          });
         return false;
+      }
       message.observedAt = prior.observedAt;
       if (message.editedAt) {
-        message.sentAt = prior.sentAt;
+        message.sentAt = prior.sentAt ?? message.sentAt;
         message.senderId = prior.senderId;
         message.senderName = prior.senderName;
         message.direction = prior.direction;

@@ -1,4 +1,5 @@
 import test from "node:test";
+import { proto } from "@whiskeysockets/baileys";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -577,6 +578,118 @@ test("metadata-only history rows cannot become pagination anchors", async () => 
     assert.equal(calls, 1);
   } finally {
     sync.close();
+    f.close();
+  }
+});
+
+test("an edited shared-history message retains its original sent date when no base message exists", () => {
+  const f = fixture();
+  try {
+    const sentAt = "2026-01-02T00:00:00.000Z";
+    const editedAt = "2026-01-02T00:05:00.000Z";
+    const result = f.wa.ingest(
+      {
+        key: { id: "history-edit", remoteJid: f.chat.jid, fromMe: false },
+        participant: "321@s.whatsapp.net",
+        messageTimestamp: Date.parse(sentAt) / 1000,
+        groupHistoryIndividualMessageInfo: {
+          bundleMessageKey: { id: "bundle", remoteJid: f.chat.jid },
+          editedAfterReceivedAsHistory: false,
+        },
+        message: {
+          protocolMessage: {
+            type: 14,
+            key: { id: "edited-file", remoteJid: f.chat.jid, fromMe: false },
+            timestampMs: Date.parse(editedAt),
+            editedMessage: {
+              documentMessage: {
+                fileName: "shared.html",
+                mimetype: "text/html",
+                caption: "updated caption",
+              },
+            },
+          },
+        },
+      },
+      "history",
+    );
+    const message = f.store.message(
+      f.store.messageId(f.chat.jid, "edited-file"),
+    );
+    assert.deepEqual(result, { id: message.id, added: true });
+    assert.equal(message.sentAt, sentAt);
+    assert.equal(message.editedAt, editedAt);
+    assert.equal(message.text, "updated caption");
+    assert.ok(message.attachmentId);
+    const p = {
+      id: "test",
+      name: "test",
+      tokenHash: hash("test"),
+      canDraft: false,
+      canSend: false,
+      enabled: true,
+    };
+    f.store.put("client", p.id, p);
+    const found = new Service(f.store, f.wa).read(p, {
+      chat_ids: [f.chat.id],
+      sent_at: { from: "2026-01-02T00:00:00Z", to: "2026-01-03T00:00:00Z" },
+      query: "updated caption",
+    });
+    assert.equal(found.messages[0]?.id, message.id);
+  } finally {
+    f.close();
+  }
+});
+
+test("late original history fills an unknown sent date without reverting the newer edit or raw content", () => {
+  const f = fixture();
+  try {
+    const sentAt = "2026-01-02T00:00:00.000Z",
+      editedAt = "2026-01-02T00:05:00.000Z";
+    f.wa.ingest(
+      {
+        key: {
+          id: "edit-event",
+          remoteJid: f.chat.jid,
+          fromMe: false,
+          participant: "321@s.whatsapp.net",
+        },
+        messageTimestamp: Date.parse(editedAt) / 1000,
+        message: {
+          protocolMessage: {
+            type: 14,
+            key: { id: "target", remoteJid: f.chat.jid, fromMe: false },
+            timestampMs: Date.parse(editedAt),
+            editedMessage: { conversation: "newer content" },
+          },
+        },
+      },
+      "live",
+    );
+    const id = f.store.messageId(f.chat.jid, "target");
+    assert.equal(f.store.message(id).sentAt, null);
+    const result = f.wa.ingest(
+      {
+        key: {
+          id: "target",
+          remoteJid: f.chat.jid,
+          fromMe: false,
+          participant: "321@s.whatsapp.net",
+        },
+        messageTimestamp: Date.parse(sentAt) / 1000,
+        message: { conversation: "old content" },
+      },
+      "history",
+    );
+    assert.deepEqual(result, { id, added: false });
+    assert.equal(f.store.message(id).sentAt, sentAt);
+    assert.equal(f.store.message(id).text, "newer content");
+    assert.equal(f.store.message(id).editedAt, editedAt);
+    const raw = proto.WebMessageInfo.fromObject(f.store.get("raw", id));
+    assert.equal(raw.message?.conversation, "newer content");
+    assert.equal(Number(raw.messageTimestamp), Date.parse(sentAt) / 1000);
+    assert.equal(f.store.historyAnchor(f.chat.id)?.id, id);
+  } finally {
     f.close();
   }
 });

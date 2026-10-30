@@ -6,6 +6,7 @@ import makeWASocket, {
   downloadMediaMessage,
   getContentType,
   normalizeMessageContent,
+  toNumber,
   jidNormalizedUser,
   type AuthenticationState,
   type SignalDataTypeMap,
@@ -34,10 +35,27 @@ function toMessage(value: unknown): WAMessage {
       participantAlt: z.string().optional(),
     })
     .parse(message.key);
-  return { ...message, key };
+  return {
+    ...message,
+    key: {
+      ...key,
+      participant: key.participant || message.participant || undefined,
+    },
+  };
 }
 const logger = pino({ level: "silent" });
 const diagnostics = pino({ level: "info" }, pino.destination(2));
+function httpStatus(error: unknown) {
+  const parsed = z
+    .object({
+      status: z.number().optional(),
+      output: z.object({ statusCode: z.number() }).optional(),
+    })
+    .safeParse(error);
+  return parsed.success
+    ? (parsed.data.output?.statusCode ?? parsed.data.status)
+    : undefined;
+}
 export class WhatsApp implements Sender {
   connected = false;
   ownerIds: string[] = [];
@@ -386,7 +404,7 @@ export class WhatsApp implements Sender {
     const requestId = await this.socket.fetchMessageHistory(
       count,
       { ...anchor.key, remoteJid: chat.jid },
-      Number(anchor.messageTimestamp) * 1000,
+      toNumber(anchor.messageTimestamp) * 1000,
     );
     diagnostics.info({
       event: "wa_history_requested",
@@ -463,8 +481,12 @@ export class WhatsApp implements Sender {
       });
     }
   }
-  ingest(raw: WAMessage, source: "live" | "history", editTime?: string) {
-    const timestamp = Number(raw.messageTimestamp || 0);
+  ingest(
+    raw: WAMessage,
+    source: "live" | "history",
+    editTime?: string,
+  ): { id: string; added: boolean } | undefined {
+    const timestamp = toNumber(raw.messageTimestamp);
     const eventTime =
       timestamp > 0 && timestamp < 8640000000000 && Number.isFinite(timestamp)
         ? new Date(timestamp * 1000).toISOString()
@@ -530,7 +552,7 @@ export class WhatsApp implements Sender {
           protocol.key?.id !== targetId)
       )
         return;
-      this.ingest(
+      const stored = this.ingest(
         {
           ...original,
           message: {
@@ -542,7 +564,7 @@ export class WhatsApp implements Sender {
         eventTime ?? new Date().toISOString(),
       );
       this.store.removeMessageEvent(id);
-      return;
+      return stored;
     }
     if (content.protocolMessage) {
       const protocol = content.protocolMessage;
@@ -552,15 +574,15 @@ export class WhatsApp implements Sender {
       )
         this.store.eraseMessage(this.store.messageId(jid, protocol.key.id));
       if (protocol.editedMessage && protocol.key?.id)
-        this.ingest(
+        return this.ingest(
           {
             ...raw,
             key: { ...raw.key, id: protocol.key.id },
             message: protocol.editedMessage,
           },
           source,
-          protocol.timestampMs && Number(protocol.timestampMs) > 0
-            ? new Date(Number(protocol.timestampMs)).toISOString()
+          protocol.timestampMs && toNumber(protocol.timestampMs) > 0
+            ? new Date(toNumber(protocol.timestampMs)).toISOString()
             : (editedAt ?? eventTime ?? new Date().toISOString()),
         );
       return;
@@ -611,8 +633,10 @@ export class WhatsApp implements Sender {
       content.audioMessage ||
       content.stickerMessage;
     const attachmentId = media ? opaque("attachment", id) : null;
-    const sentAt = editedAt ? null : eventTime;
-    const existed = this.store.findMessage(id) !== null;
+    // HistorySync keeps the original sent timestamp even when the payload is an edit.
+    const sentAt = editedAt && source !== "history" ? null : eventTime;
+    const previous = this.store.findMessage(id);
+    const existed = previous !== null;
     const saved = this.store.saveMessage({
       editedAt,
       updatedAt: new Date().toISOString(),
@@ -650,7 +674,19 @@ export class WhatsApp implements Sender {
             ).toISOString()
           : null,
     });
-    if (!saved || this.store.message(id).deleted) return;
+    const current = this.store.message(id);
+    if (current.deleted) return;
+    if (!saved) {
+      if (source === "history" && !previous?.sentAt && current.sentAt) {
+        const retained = this.store.get("raw", id);
+        if (retained)
+          this.store.put("raw", id, {
+            ...z.record(z.unknown()).parse(retained),
+            messageTimestamp: Date.parse(current.sentAt) / 1000,
+          });
+      }
+      return { id: current.id, added: false };
+    }
     const previousRaw = this.store.get("raw", id);
     const previousMessage = previousRaw
       ? proto.WebMessageInfo.fromObject(previousRaw)
@@ -702,19 +738,27 @@ export class WhatsApp implements Sender {
     const raw = this.store.get("raw", parsed.messageId);
     if (!raw) throw new Error("Media unavailable");
     const message = toMessage(raw);
-    const stream = await downloadMediaMessage(
-      message,
-      "stream",
-      { options: { signal: AbortSignal.timeout(20000) } },
-      {
-        logger,
-        reuploadRequest:
-          this.socket?.updateMediaMessage ??
-          (async () => {
-            throw new Error("Offline");
-          }),
-      },
-    );
+    const download = (message: WAMessage) =>
+      downloadMediaMessage(message, "stream", {
+        options: { signal: AbortSignal.timeout(20000) },
+      });
+    const stream = await download(message).catch(async (error: unknown) => {
+      if (!this.socket || ![403, 404, 410].includes(httpStatus(error) ?? 0))
+        throw error;
+      // rc14 throws Boom errors here but its retry path checks error.status.
+      let refreshed: WAMessage;
+      try {
+        refreshed = await this.socket.updateMediaMessage(message);
+      } catch (error) {
+        if (httpStatus(error) === 404)
+          throw new BridgeError(
+            "media_unavailable",
+            "WhatsApp could not provide this attachment. Its message and metadata remain available, but file bytes were not retrieved.",
+          );
+        throw error;
+      }
+      return download(refreshed);
+    });
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of stream) {

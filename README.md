@@ -247,11 +247,15 @@ need initial history or a new message before they can fetch earlier messages.
 New pairings request `syncFullHistory: true` using Baileys' default Chrome
 profile. Existing pairings keep their saved sync preference. Set
 `WHATSAPP_HISTORY_MODE=recent` for lighter initial sync, or `full` to request
-broader history. Both modes keep the same browser identity. WhatsApp decides how
+broader history. Pairing also enables history shared with you when you joined a
+group. Both modes keep the same browser identity. WhatsApp decides how
 much history it shares; full mode does not guarantee every older message.
 `get_status.history_sync` reports the configured mode and last history event or phase. Scrolling a separate WhatsApp Web session does not populate
 this service. Disappearing, deleted, expired, and view-once content still follows
-the existing retention rules.
+the existing retention rules. A recovered attachment message does not guarantee
+that WhatsApp still has its file bytes. The service asks the phone to refresh
+expired media references; if the phone cannot provide the file, the message and
+metadata remain readable.
 
 ## Data and operation
 

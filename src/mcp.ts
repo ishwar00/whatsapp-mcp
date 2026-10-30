@@ -247,6 +247,10 @@ export function createMcp(
               type: "text",
               text: JSON.stringify({
                 code: e instanceof BridgeError ? e.code : "media_unavailable",
+                message:
+                  e instanceof BridgeError
+                    ? e.message
+                    : "The attachment could not be downloaded from WhatsApp",
               }),
             },
           ],
