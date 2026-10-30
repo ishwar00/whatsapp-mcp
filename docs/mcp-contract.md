@@ -22,41 +22,60 @@ means removal. `direction: "outgoing"` identifies the owner's messages.
 
 ## History retrieval
 
-`get_history_coverage({chat_id})` returns `stored_messages`, `oldest_message_at`,
-`newest_message_at`, and unknown gap/completeness indicators. Unknown dates are null.
+Reads and searches are local operations. When `chat_ids` is provided, their
+`chat_coverage` contains stored counts and date bounds for those chats, including
+on empty results. Completeness and gaps remain unknown; null bounds mean no dated
+stored messages. Reads and searches do not start backfill.
 
-`sync_history({chat_id, sent_at?, max_batches?})` creates or joins a bounded background
-job. `sent_at` uses the same increasing ISO date range as reads. `max_batches` is
-1–10, default 3; each phone request asks for 50 messages. No usable raw-message
-anchor returns a job with state `no_anchor`, not a fabricated request.
+`sync_history({chat_id, before_message_id?, sent_at?, max_batches?})` creates or joins
+a bounded background job. `sent_at` is the same increasing ISO date range as reads.
+`max_batches` is 1–10, default 3; each phone request asks for 50 messages.
 
-`get_history_status({job_id})` returns the job's `id`, `chat_id`, requested `sent_at`,
-batch budget, `batches_requested`, `messages_added`, timestamps, state, error, and
-current stored bounds. Work starts `queued`, then `running`, and terminates with:
+Anchor selection is explicit: use `before_message_id` when supplied; otherwise use
+the nearest raw message at or after the requested range's `to`, falling back to the
+newest raw message. Without a range, use the oldest raw message. A missing/deleted
+anchor, an anchor in another chat, or one older than the whole requested range
+returns `no_anchor`. Existing date bounds never satisfy a new request by themselves.
+
+`get_history_status({job_id})` returns requested scope, budget, `batches_requested`,
+`messages_added`, timestamps, state, error, current stored bounds, and traversal:
+
+- `anchor_message_id`: the starting raw message.
+- `next_message_id`: the last confirmed cursor for a later explicit fetch.
+- `traversed_from` and `traversed_to`: response-derived bounds, not proof of complete
+  coverage. Both stay null until a completed response advances the cursor.
+- `response_progress`: latest progress in the current matching response, or null.
+
+Work starts `queued`, then `running`, and terminates with:
 
 | State | Meaning |
 |---|---|
-| `target_reached` | Stored oldest date reaches requested `from`; gaps remain unknown |
-| `batch_limit` | Budget used; more history may exist |
-| `no_progress` | Matching response did not move the oldest stored date backwards |
-| `timed_out` | No matching response within 30 seconds |
-| `no_anchor` | No usable stored raw message for this chat |
+| `target_reached` | Completed matching responses walked to requested `from` or earlier |
+| `batch_limit` | Batch budget used; more history may exist |
+| `no_progress` | A completed matching response supplied no earlier usable cursor |
+| `timed_out` | Dispatch or matching response was absent at the 30-second deadline |
+| `response_incomplete` | Matching chunks arrived without confirmed completion by the deadline |
+| `no_anchor` | No usable starting raw message for this chat and requested scope |
 | `offline` | WhatsApp is disconnected |
 | `failed` | Dispatch or processing failed |
 | `interrupted` | Service stopped or restarted before finishing |
 
-Backfill never marks all history complete. `messages_added` counts net stored
-message growth during each requested batch, not the number of messages WhatsApp
-claims it sent. Live arrivals during that interval can also affect this count.
-Only one job runs at a time. At most ten jobs can be active or queued. Same-chat
-requests share an active job and its original scope. The last 100 completed jobs
-are retained for status lookup; messages remain governed by normal retention.
+Completion requires `progress: 100` on a matching on-demand history event. Chunks
+arriving before dispatch returns are buffered and matched once its request ID is
+known. Wrong or absent IDs cannot complete the job. Chunks without completion can
+add messages, but cannot confirm traversal or trigger automatic pagination.
+`messages_added` counts newly ingested IDs in correlated chunks, excluding duplicates,
+identity reconciliation, and unrelated traffic. Stored messages remain usable even
+when a response is incomplete or arrives after a timeout.
 
-Reads and searches accept `fetch_history` and `max_history_batches` for exactly one
-chat without `page`. Results remain local and return `results_scope: local_so_far`
-and `history_sync`. Poll and issue a fresh read/search, without fetching or paging,
-afterward. Existing page cursors keep their original observation watermark.
-The stdio adapter never automatically replays a backfill-triggering request.
+One job runs at a time, with at most ten active/queued. Same-chat requests share a
+job only when range, explicit anchor, and budget match; differing scopes return
+`busy` with its ID. Unfinished jobs become interrupted after a restart. The last
+100 completed jobs are retained; messages follow normal retention. The stdio adapter
+never automatically replays `sync_history`, while local reads remain safe to retry.
+
+After sync, issue a fresh local query to include new messages. Existing page
+cursors retain their original observation watermark.
 
 ## Drafts and sends
 

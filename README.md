@@ -205,29 +205,44 @@ Ask your agent to "load the September conversation in this chat" or "search olde
 messages for the DNS change". The service stores retrieved history so every connected
 agent can reuse it.
 
-- `get_history_coverage` shows stored message dates and count for a chat. These are
-  bounds, not proof that every message between them is present.
-- `sync_history` takes `chat_id`, an optional `sent_at` date range, and `max_batches`
-  from 1 to 10, default 3. Each batch requests 50 messages before the oldest stored
-  raw message. With a range, it stops when the oldest stored date reaches `from`.
-  `to` describes the intended read range; it does not make WhatsApp jump to that date.
-- Poll `get_history_status` using the returned `id` as `job_id`, then read or search
-  the requested range. Jobs survive client disconnects. A service restart marks
-  unfinished jobs `interrupted`; it does not silently retry them.
-- `read_messages` and `search_messages` accept `fetch_history: true` and
-  `max_history_batches` when exactly one chat is selected and no page cursor is used.
-  They return local results immediately plus a background job. Poll it, then repeat
-  the query without `fetch_history` or a page cursor to include arriving messages.
+1. Call `sync_history` with `chat_id`, optional `sent_at` date range, and a batch
+   budget `max_batches` from 1 to 10, default 3.
+2. Poll `get_history_status` using the returned `id` as `job_id`.
+3. Call `read_messages` or `search_messages` locally with the desired filters.
+   Start a fresh query without a previous page cursor to include arriving messages.
 
-Terminal outcomes distinguish `target_reached`, `batch_limit`, `no_progress`,
+Reads and searches never initiate network fetching. Their `chat_coverage` includes
+stored date bounds and count for each requested chat, including when a search finds
+nothing. Bounds do not prove every message between those dates is present.
+
+Without a date range, sync starts at the oldest usable stored raw message. For a
+range, it starts at the nearest usable message at or after `to`, falling back to
+the newest available message if necessary. It never treats an unrelated earlier
+stored message as evidence that the requested period was fetched. You can supply
+`before_message_id` to choose a specific starting anchor.
+
+Each batch requests 50 messages. A completed response supplies the next anchor,
+even if those messages were already stored. `traversed_from` and `traversed_to`
+show the actual dates walked by completed responses. They may differ from the
+requested dates and still do not establish gap-free coverage. `next_message_id`
+is the last confirmed cursor, usable as `before_message_id` on a later request.
+
+Jobs match responses by request ID. A matching chunk with `progress: 100` confirms
+completion; neither a first chunk nor a fixed pause does. Each batch has a 30-second
+deadline covering dispatch and response. If data arrives without confirmation, the
+job ends `response_incomplete`; the messages remain available to local queries.
+Uncorrelated chunks are stored normally but cannot complete or advance a job.
+
+Other terminal outcomes are `target_reached`, `batch_limit`, `no_progress`,
 `timed_out`, `no_anchor`, `offline`, `failed`, and `interrupted`. None proves that
-WhatsApp has no older messages. Duplicate responses stop automatic pagination.
-Requests are serialized, and an active request for the same chat is shared. If
-another request joins it, inspect the returned job's date range and batch budget.
+WhatsApp has no older messages. `messages_added` counts new messages in matching
+responses, excluding duplicates and unrelated live traffic.
 
-A batch waits up to 30 seconds for a matching history event. A submitted request
-alone is not success. The phone must be able to respond. Chats with no stored raw
-message need initial history or a new message before they have a usable anchor.
+Requests are serialized. Matching requests for one chat share an active job;
+a different scope returns `busy` with the existing job ID. Jobs survive client
+disconnects; a service restart marks unfinished jobs `interrupted` without retrying
+them. The phone must be able to respond. Chats with no usable stored raw message
+need initial history or a new message before they can fetch earlier messages.
 
 New pairings use Baileys' desktop profile with `syncFullHistory: true` to request
 broader initial history. Existing pairings keep their previous profile, which is

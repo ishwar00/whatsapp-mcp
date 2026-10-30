@@ -1031,15 +1031,12 @@ test("adapter reconnects expired reads once and never automatically replays a se
       ),
     );
     await expireSession();
-    await assert.rejects(
-      client.callTool({
-        name: "read_messages",
-        arguments: { chat_ids: [f.a.id], fetch_history: true },
-      }),
-      /404/,
-    );
-    assert.equal(calls.filter((name) => name === "read_messages").length, 1);
-    await status();
+    const localRead = await client.callTool({
+      name: "read_messages",
+      arguments: { chat_ids: [f.a.id] },
+    });
+    assert.equal(localRead.isError, undefined);
+    assert.equal(calls.filter((name) => name === "read_messages").length, 2);
     await expireSession();
     await assert.rejects(
       client.callTool({ name: "sync_history", arguments: { chat_id: f.a.id } }),

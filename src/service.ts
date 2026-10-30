@@ -83,6 +83,7 @@ export class Service {
           ).toString("base64url")
         : null,
       coverage: this.coverage(),
+      chat_coverage: q.chat_ids?.map((id) => this.store.historyCoverage(id)),
     };
   }
   context(p: Principal, chatId: string, id: string, before = 10, after = 10) {

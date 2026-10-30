@@ -92,7 +92,8 @@ export class WhatsApp implements Sender {
   constructor(public store: Store) {
     this.history = new HistorySync(store, {
       connected: () => this.connected,
-      request: (chat, count) => this.requestHistory(chat, count),
+      request: (chat, count, anchorId) =>
+        this.requestHistory(chat, count, anchorId),
     });
   }
   auth(): AuthenticationState {
@@ -335,17 +336,17 @@ export class WhatsApp implements Sender {
         for (const c of chats)
           if (c.id) this.store.saveChat(c.id, c.name ?? undefined);
         for (const contact of contacts) this.saveContact(contact);
-        for (const m of messages) this.ingest(m, "history");
-        this.history.received({
-          chats: [
-            ...new Set(
-              messages.flatMap((m) =>
-                m.key.remoteJid ? [opaque("chat", m.key.remoteJid)] : [],
-              ),
-            ),
-          ],
-          requestId: peerDataRequestSessionId,
-        });
+        const historyMessages: { id: string; added: boolean }[] = [];
+        for (const raw of messages) {
+          const stored = this.ingest(raw, "history");
+          if (stored) historyMessages.push(stored);
+        }
+        if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND)
+          this.history.received({
+            requestId: peerDataRequestSessionId,
+            progress,
+            messages: historyMessages,
+          });
       },
     );
     sock.ev.on("messaging-history.status", (status) => {
@@ -411,11 +412,11 @@ export class WhatsApp implements Sender {
       }
     });
   }
-  async requestHistory(chatId: string, count: number) {
+  async requestHistory(chatId: string, count: number, anchorId?: string) {
     if (!this.connected || !this.socket)
       throw new BridgeError("service_offline");
     const chat = this.store.chat(chatId);
-    const oldest = this.store.historyAnchor(chatId);
+    const oldest = this.store.historyAnchor(chatId, { messageId: anchorId });
     const value = oldest && this.store.get("raw", oldest.id);
     const anchor = value ? toMessage(value) : undefined;
     if (!anchor?.key.id || !anchor.messageTimestamp)
@@ -652,6 +653,7 @@ export class WhatsApp implements Sender {
       content.stickerMessage;
     const attachmentId = media ? opaque("attachment", id) : null;
     const sentAt = editedAt ? null : eventTime;
+    const existed = this.store.findMessage(id) !== null;
     const saved = this.store.saveMessage({
       editedAt,
       updatedAt: new Date().toISOString(),
@@ -733,6 +735,7 @@ export class WhatsApp implements Sender {
           });
       }
     }
+    return { id: this.store.message(id).id, added: !existed };
   }
   async download(id: string) {
     const parsed = this.store.attachments.get(id);

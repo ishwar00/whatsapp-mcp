@@ -370,15 +370,34 @@ export class Store {
       gaps: "unknown",
     };
   }
-  historyAnchor(chatId: string) {
+  historyAnchor(
+    chatId: string,
+    options: { messageId?: string; atOrAfter?: string } = {},
+  ) {
     const chat = this.chat(chatId);
-    const row = this.db
-      .prepare(
-        `SELECT m.value FROM messages m JOIN objects r ON r.kind='raw' AND r.id=m.id
-      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL
-      ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`,
-      )
-      .get(chat.id);
+    const base = `SELECT m.value FROM messages m JOIN objects r ON r.kind='raw' AND r.id=m.id
+      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL`;
+    let row;
+    if (options.messageId) {
+      row = this.db
+        .prepare(`${base} AND m.id=?`)
+        .get(chat.id, this.resolveId("message-alias", options.messageId));
+    } else if (options.atOrAfter) {
+      row = this.db
+        .prepare(
+          `${base} AND m.sent>=? ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`,
+        )
+        .get(chat.id, new Date(options.atOrAfter).toISOString());
+      row ??= this.db
+        .prepare(
+          `${base} ORDER BY coalesce(m.sent,m.observed) DESC,m.id DESC LIMIT 1`,
+        )
+        .get(chat.id);
+    } else {
+      row = this.db
+        .prepare(`${base} ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`)
+        .get(chat.id);
+    }
     return row
       ? messageSchema.parse(JSON.parse(rowSchema.parse(row).value))
       : null;
@@ -579,13 +598,19 @@ export class Store {
       ...side(">", "ASC", after),
     ];
   }
-  message(id: string) {
+  findMessage(id: string) {
     id = this.resolveId("message-alias", id);
     const row = this.db
       .prepare("SELECT value FROM messages WHERE id=?")
       .get(id);
-    if (!row) throw new BridgeError("not_found_or_not_permitted");
-    return messageSchema.parse(JSON.parse(rowSchema.parse(row).value));
+    return row
+      ? messageSchema.parse(JSON.parse(rowSchema.parse(row).value))
+      : null;
+  }
+  message(id: string) {
+    const message = this.findMessage(id);
+    if (!message) throw new BridgeError("not_found_or_not_permitted");
+    return message;
   }
   saveMessage(message: Message) {
     message = {

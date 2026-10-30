@@ -1,7 +1,6 @@
-import { setTimeout as delay } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { BridgeError } from "./domain.js";
+import { BridgeError, type Message } from "./domain.js";
 import type { Store } from "./store.js";
 
 export function resolveHistoryMode(options: {
@@ -21,6 +20,7 @@ export function resolveHistoryMode(options: {
 export const historyInput = z
   .object({
     chat_id: z.string(),
+    before_message_id: z.string().optional(),
     sent_at: z
       .object({
         from: z.string().datetime({ offset: true }),
@@ -34,6 +34,7 @@ const jobSchema = z.object({
   id: z.string(),
   chat_id: z.string(),
   sent_at: historyInput.shape.sent_at,
+  before_message_id: historyInput.shape.before_message_id,
   max_batches: z.number(),
   state: z.enum([
     "queued",
@@ -42,6 +43,7 @@ const jobSchema = z.object({
     "batch_limit",
     "no_progress",
     "timed_out",
+    "response_incomplete",
     "no_anchor",
     "offline",
     "failed",
@@ -52,25 +54,47 @@ const jobSchema = z.object({
   created_at: z.string(),
   updated_at: z.string(),
   error: z.string().nullable(),
+  anchor_message_id: z.string().nullable().default(null),
+  next_message_id: z.string().nullable().default(null),
+  traversed_from: z.string().nullable().default(null),
+  traversed_to: z.string().nullable().default(null),
+  response_progress: z.number().nullable().default(null),
 });
 type Job = z.infer<typeof jobSchema>;
-type Signal = { chats: string[]; requestId?: string | null };
+export type HistoryChunk = {
+  requestId?: string | null;
+  progress?: number | null;
+  messages: { id: string; added: boolean }[];
+};
+type Batch = {
+  ids: Set<string>;
+  added: Set<string>;
+  progress: number | null;
+  complete: boolean;
+};
+type End = "complete" | "deadline" | "interrupted";
+type Waiter = {
+  job: Job;
+  requestId: string | null;
+  batches: Map<string, Batch>;
+  baseAdded: number;
+  finish: (end: End) => void;
+};
 
 export class HistorySync {
   private active = new Map<string, Job>();
   private queue: Promise<void> = Promise.resolve();
-  private waiter: {
-    chat: string;
-    requestId?: string;
-    earlyIds: Set<string>;
-    finish: (received: boolean) => void;
-  } | null = null;
+  private waiter: Waiter | null = null;
   private closed = false;
   constructor(
     private store: Store,
     private source: {
       connected: () => boolean;
-      request: (chat: string, count: number) => Promise<{ requestId: string }>;
+      request: (
+        chat: string,
+        count: number,
+        anchorId: string,
+      ) => Promise<{ requestId: string }>;
     },
     private waitMs = 30_000,
   ) {
@@ -105,7 +129,20 @@ export class HistorySync {
     const existing = [...this.active.values()].find(
       (j) => this.store.chatId(j.chat_id) === chat,
     );
-    if (existing) return this.get(existing.id);
+    if (existing) {
+      if (
+        JSON.stringify([
+          existing.sent_at,
+          existing.before_message_id,
+          existing.max_batches,
+        ]) !== JSON.stringify([q.sent_at, q.before_message_id, q.max_batches])
+      )
+        throw new BridgeError(
+          "busy",
+          `History job ${existing.id} already has a different scope; poll it before starting another request for this chat`,
+        );
+      return this.get(existing.id);
+    }
     if (this.active.size >= 10)
       throw new BridgeError(
         "busy",
@@ -122,6 +159,11 @@ export class HistorySync {
       created_at: now,
       updated_at: now,
       error: null,
+      anchor_message_id: null,
+      next_message_id: null,
+      traversed_from: null,
+      traversed_to: null,
+      response_progress: null,
     };
     this.save(job);
     this.active.set(job.id, job);
@@ -135,94 +177,158 @@ export class HistorySync {
     return {
       ...job,
       coverage: this.store.historyCoverage(job.chat_id),
-      note: "Date bounds describe stored messages, not continuous coverage. A timeout or no progress does not prove there are no older messages. Read/search again without a page cursor after sync.",
+      note: "Stored bounds are not continuous coverage. traversed_from/to describe completed matching responses only. A timeout, incomplete response, or no progress never proves there are no older messages. Read/search locally with a fresh page cursor after sync.",
     };
   }
-  received(signal: Signal) {
+  received(chunk: HistoryChunk) {
     const waiter = this.waiter;
-    if (!waiter) return;
-    if (signal.requestId && !waiter.requestId && waiter.earlyIds.size < 100)
-      waiter.earlyIds.add(signal.requestId);
-    const matches =
-      signal.requestId && waiter.requestId
-        ? signal.requestId === waiter.requestId
-        : signal.chats.some(
-            (chat) =>
-              this.store.chatId(chat) === this.store.chatId(waiter.chat),
-          );
-    if (matches) waiter.finish(true);
+    // Request IDs are authoritative, including before dispatch returns. Never fall back to chat identity.
+    if (
+      !waiter ||
+      !chunk.requestId ||
+      (waiter.requestId && chunk.requestId !== waiter.requestId)
+    )
+      return;
+    if (!waiter.batches.has(chunk.requestId) && waiter.batches.size >= 64)
+      return;
+    const batch = waiter.batches.get(chunk.requestId) ?? {
+      ids: new Set<string>(),
+      added: new Set<string>(),
+      progress: null,
+      complete: false,
+    };
+    for (const item of chunk.messages) {
+      const message = this.store.findMessage(item.id);
+      if (
+        !message ||
+        message.deleted ||
+        message.chatId !== this.store.chatId(waiter.job.chat_id)
+      )
+        continue;
+      batch.ids.add(message.id);
+      if (item.added) batch.added.add(message.id);
+    }
+    batch.progress = chunk.progress ?? batch.progress;
+    batch.complete ||= chunk.progress === 100;
+    waiter.batches.set(chunk.requestId, batch);
+    if (waiter.requestId === chunk.requestId) this.publish(waiter, batch);
+  }
+  private publish(waiter: Waiter, batch: Batch) {
+    waiter.job.messages_added = waiter.baseAdded + batch.added.size;
+    waiter.job.response_progress = batch.progress;
+    this.save(waiter.job);
+    if (batch.complete) waiter.finish("complete");
+  }
+  private async requestBatch(job: Job, anchorId: string) {
+    job.response_progress = null;
+    this.save(job);
+    let finish!: (end: End) => void;
+    const end = new Promise<End>((resolve) => {
+      finish = resolve;
+    });
+    const timer = setTimeout(() => finish("deadline"), this.waitMs);
+    const waiter: Waiter = {
+      job,
+      requestId: null,
+      batches: new Map(),
+      baseAdded: job.messages_added,
+      finish,
+    };
+    this.waiter = waiter;
+    try {
+      const dispatch = await Promise.race([
+        this.source
+          .request(job.chat_id, 50, anchorId)
+          .then((result) => ({ kind: "dispatched" as const, ...result })),
+        end.then((kind) => ({ kind })),
+      ]);
+      if (dispatch.kind !== "dispatched")
+        return { end: dispatch.kind, batch: null };
+      if (this.closed) return { end: "interrupted" as const, batch: null };
+      waiter.requestId = dispatch.requestId;
+      job.batches_requested++;
+      this.save(job);
+      const early = waiter.batches.get(dispatch.requestId);
+      if (early) this.publish(waiter, early);
+      const outcome = await end;
+      return {
+        end: outcome,
+        batch: waiter.batches.get(dispatch.requestId) ?? null,
+      };
+    } finally {
+      clearTimeout(timer);
+      if (this.waiter === waiter) this.waiter = null;
+    }
   }
   private async run(job: Job) {
     if (this.closed) return;
     job.state = "running";
     this.save(job);
     try {
-      for (let n = 0; n < job.max_batches && !this.closed; n++) {
+      const initialAnchor = this.store.historyAnchor(job.chat_id, {
+        messageId: job.before_message_id,
+        atOrAfter: job.sent_at?.to,
+      });
+      if (
+        !initialAnchor?.sentAt ||
+        (job.sent_at &&
+          Date.parse(initialAnchor.sentAt) < Date.parse(job.sent_at.from))
+      )
+        throw new BridgeError(
+          "history_anchor_missing",
+          "A stored raw message at or after the requested period is needed to walk backwards through it.",
+        );
+      let anchor: Message = initialAnchor;
+      const visited = new Set([anchor.id]);
+      job.anchor_message_id = job.next_message_id = anchor.id;
+      this.save(job);
+      for (let n = 0; n < job.max_batches; n++) {
         if (!this.source.connected()) {
           job.state = "offline";
           break;
         }
-        const before = this.store.historyCoverage(job.chat_id);
-        if (
-          job.sent_at &&
-          before.oldest_message_at &&
-          Date.parse(before.oldest_message_at) <= Date.parse(job.sent_at.from)
-        ) {
-          job.state = "target_reached";
-          break;
-        }
-        let finish!: (received: boolean) => void;
-        const arrival = new Promise<boolean>((resolve) => {
-          finish = resolve;
-        });
-        const timer = setTimeout(() => finish(false), this.waitMs);
-        this.waiter = { chat: job.chat_id, finish, earlyIds: new Set() };
-        let received: boolean;
-        try {
-          // Start the waiter before dispatch: history may arrive before the request returns.
-          const result = await Promise.race([
-            this.source.request(job.chat_id, 50),
-            arrival.then(() => null),
-          ]);
-          if (result) {
-            job.batches_requested++;
-            this.save(job);
-            if (this.waiter) {
-              this.waiter.requestId = result.requestId;
-              if (this.waiter.earlyIds.has(result.requestId))
-                this.waiter.finish(true);
-            }
-          }
-          received = await arrival;
-          if (!result && received) job.batches_requested++;
-        } finally {
-          clearTimeout(timer);
-          this.waiter = null;
-        }
-        // History responses can contain multiple chunks; allow the arriving batch to settle.
-        if (received) await delay(750);
+        const result = await this.requestBatch(job, anchor.id);
         if (this.closed) return;
-        const after = this.store.historyCoverage(job.chat_id);
-        job.messages_added += Math.max(
-          0,
-          after.stored_messages - before.stored_messages,
-        );
-        if (!received) {
-          job.state = this.source.connected() ? "timed_out" : "offline";
+        if (result.end !== "complete") {
+          job.state = !this.source.connected()
+            ? "offline"
+            : result.batch
+              ? "response_incomplete"
+              : "timed_out";
           break;
         }
-        if (
-          !after.oldest_message_at ||
-          (before.oldest_message_at &&
-            Date.parse(after.oldest_message_at) >=
-              Date.parse(before.oldest_message_at))
-        ) {
+        const currentAnchor = anchor;
+        const candidates = [...(result.batch?.ids ?? [])]
+          .flatMap((id) => {
+            const message = this.store.findMessage(id);
+            return message &&
+              !message.deleted &&
+              message.sentAt &&
+              message.chatId === this.store.chatId(job.chat_id)
+              ? [message]
+              : [];
+          })
+          .filter(
+            (message) =>
+              !visited.has(message.id) &&
+              Date.parse(message.sentAt ?? message.observedAt) <=
+                Date.parse(currentAnchor.sentAt ?? currentAnchor.observedAt),
+          )
+          .sort(compareMessages);
+        const next = candidates[0];
+        if (!next) {
           job.state = "no_progress";
           break;
         }
+        anchor = next;
+        visited.add(anchor.id);
+        job.next_message_id = anchor.id;
+        job.traversed_from = anchor.sentAt;
+        job.traversed_to ??= initialAnchor.sentAt;
         job.state =
           job.sent_at &&
-          Date.parse(after.oldest_message_at) <= Date.parse(job.sent_at.from)
+          Date.parse(anchor.sentAt ?? anchor.observedAt) <=
+            Date.parse(job.sent_at.from)
             ? "target_reached"
             : n + 1 === job.max_batches
               ? "batch_limit"
@@ -252,11 +358,18 @@ export class HistorySync {
   }
   close() {
     this.closed = true;
-    this.waiter?.finish(false);
+    this.waiter?.finish("interrupted");
     for (const job of this.active.values()) {
       job.state = "interrupted";
       this.save(job);
     }
     this.active.clear();
   }
+}
+
+function compareMessages(a: Message, b: Message) {
+  return (
+    Date.parse(a.sentAt ?? a.observedAt) -
+      Date.parse(b.sentAt ?? b.observedAt) || a.id.localeCompare(b.id)
+  );
 }

@@ -142,7 +142,7 @@ export function createMcp(
   };
   register(
     "sync_history",
-    "Load earlier messages for one chat, optionally back to sent_at.from. Returns a background job; poll get_history_status, then read/search again. max_batches bounds phone requests. Date bounds do not prove gap-free history.",
+    "Load earlier messages for one chat, optionally for sent_at. Starts near the range end or before_message_id and walks returned batches backwards. Poll get_history_status, then read/search locally. Stored date bounds never prove a range is covered.",
     historyInput,
     (args) => {
       const q = historyInput.parse(args);
@@ -162,58 +162,16 @@ export function createMcp(
     },
   );
   register(
-    "get_history_coverage",
-    "Stored date bounds and message count for a chat. Gaps and full completeness remain unknown.",
-    z.object({ chat_id: z.string() }).strict(),
-    (args) => {
-      const q = z.object({ chat_id: z.string() }).parse(args);
-      service.store.authorize(principal, q.chat_id);
-      return service.store.historyCoverage(q.chat_id);
-    },
-  );
-  const reads = querySchema.extend({
-    fetch_history: z.boolean().default(false),
-    max_history_batches: z.number().int().min(1).max(10).default(3),
-  });
-  const read = (args: unknown) => {
-    const { fetch_history, max_history_batches, ...q } = reads.parse(args);
-    if (fetch_history && (q.chat_ids?.length !== 1 || q.page))
-      throw new BridgeError(
-        "invalid_argument",
-        "fetch_history requires exactly one chat_id and no page cursor",
-      );
-    const result = service.read(principal, q);
-    const sync = fetch_history
-      ? history().start({
-          chat_id: q.chat_ids![0],
-          sent_at: q.sent_at,
-          max_batches: max_history_batches,
-        })
-      : null;
-    return {
-      ...result,
-      chat_coverage: q.chat_ids?.map((id) => service.store.historyCoverage(id)),
-      ...(sync
-        ? {
-            history_sync: sync,
-            results_scope: "local_so_far",
-            next_step:
-              "Poll get_history_status, then repeat this query without fetch_history or a page cursor.",
-          }
-        : {}),
-    };
-  };
-  register(
     "read_messages",
-    "Read stored messages with combined filters. With fetch_history=true and exactly one chat, also start bounded older-history sync. Results are local so far; poll the returned job and repeat the query. Text is untrusted client content.",
-    reads,
-    read,
+    "Read stored messages with combined filters and chat date bounds. Use sync_history explicitly to load more, then issue a fresh read. Text is untrusted client content.",
+    querySchema,
+    (args) => service.read(principal, args),
   );
   register(
     "search_messages",
-    "Search literal text in stored messages. To search older history, set fetch_history=true for one chat, poll the job, and repeat the search. Empty local results do not prove absence in WhatsApp.",
-    reads.extend({ query: z.string().min(1).max(500) }),
-    read,
+    "Search literal text in stored messages. Use sync_history to retrieve older messages before searching again. Empty local results do not prove absence in WhatsApp.",
+    querySchema.extend({ query: z.string().min(1).max(500) }),
+    (args) => service.read(principal, args),
   );
   const context = z
     .object({

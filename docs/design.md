@@ -43,9 +43,13 @@ Incoming history is ingested through the same message, identity, edit, and media
 paths as other messages. Matching history events wake the job; request submission
 alone does not mean messages arrived. Timeouts and no-progress responses stop it.
 
-Jobs use the oldest usable raw message as an anchor. Date targets stop pagination
-once the stored oldest date reaches the requested start; they do not prove there
-are no gaps. Retrieved messages are shared by all local clients through SQLite.
+Jobs use an explicit raw-message anchor, or choose one near the requested range end.
+Each completed correlated response supplies the next anchor. Sparse stored date
+bounds cannot satisfy a new fetch. Early responses are buffered until dispatch
+returns its ID; no chat-based fallback or fixed sleep establishes completion.
+Matching data without a completion marker remains available but ends as incomplete
+at the deadline. Retrieved messages are shared across local clients through SQLite.
+Coverage lives in local read results; network fetching is a separate explicit action.
 The owner history endpoint uses the same queue and job format as MCP.
 
 New pairings request desktop/full history. Existing pairings preserve their device

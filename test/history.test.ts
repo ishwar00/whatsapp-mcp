@@ -14,15 +14,17 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "wa-history-"));
-  const store = new Store(dir);
-  const wa = new WhatsApp(store);
+  const store = new Store(dir),
+    wa = new WhatsApp(store);
   const chat = store.saveChat("12345@g.us", "History test");
-  let id = 0;
-  const ingest = (date: string) =>
+  let sequence = 0;
+  const ingest = (date: string, providerId = `m${++sequence}`) => {
+    const id = store.messageId(chat.jid, providerId);
+    const existed = store.findMessage(id) !== null;
     wa.ingest(
       {
         key: {
-          id: `m${++id}`,
+          id: providerId,
           remoteJid: chat.jid,
           fromMe: false,
           participant: "321@s.whatsapp.net",
@@ -32,6 +34,8 @@ function fixture() {
       },
       "history",
     );
+    return { id: store.message(id).id, added: !existed };
+  };
   return {
     dir,
     store,
@@ -53,84 +57,186 @@ async function terminal(sync: HistorySync, id: string) {
   }
   throw new Error("history job did not finish");
 }
-test("backfill walks older anchors, persists received messages, reaches the date, and shares in-flight jobs", async () => {
+const september = { from: "2026-09-01T00:00:00Z", to: "2026-10-01T00:00:00Z" };
+
+test("sparse date ranges fetch near the range end and traverse responses rather than global stored bounds", async () => {
   const f = fixture();
-  let sync!: HistorySync;
-  let calls = 0;
-  f.ingest("2026-10-20T00:00:00Z");
+  f.ingest("2026-08-01T00:00:00Z");
+  const start = f.ingest("2026-10-01T00:00:00Z");
+  let sync!: HistorySync,
+    calls = 0,
+    nextId = start.id;
   sync = new HistorySync(
     f.store,
     {
       connected: () => true,
-      request: async (chat, count) => {
+      request: async (chat, count, anchorId) => {
         assert.equal(count, 50);
-        assert.equal(
-          f.store.historyAnchor(chat)?.sentAt,
-          calls === 0 ? "2026-10-20T00:00:00.000Z" : "2026-09-20T00:00:00.000Z",
-        );
+        assert.equal(anchorId, nextId);
         calls++;
-        f.ingest(calls === 1 ? "2026-09-20T00:00:00Z" : "2026-08-20T00:00:00Z");
-        sync.received({ chats: [chat], requestId: `r${calls}` });
+        const message = f.ingest(
+          calls === 1 ? "2026-09-20T00:00:00Z" : "2026-08-30T00:00:00Z",
+        );
+        nextId = message.id;
+        sync.received({
+          requestId: `r${calls}`,
+          progress: 100,
+          messages: [message],
+        });
         return { requestId: `r${calls}` };
       },
     },
     100,
   );
   try {
-    const input = {
-      chat_id: f.chat.id,
-      sent_at: { from: "2026-09-01T00:00:00Z", to: "2026-10-01T00:00:00Z" },
-    };
-    const job = sync.start(input);
-    assert.equal(sync.start(input).id, job.id);
+    const job = sync.start({ chat_id: f.chat.id, sent_at: september });
+    assert.equal(
+      sync.start({ chat_id: f.chat.id, sent_at: september }).id,
+      job.id,
+    );
     const result = await terminal(sync, job.id);
     assert.equal(result.state, "target_reached");
-    assert.equal(result.messages_added, 2);
-    assert.equal(result.batches_requested, 2);
+    assert.equal(calls, 2);
+    assert.equal(result.anchor_message_id, start.id);
+    assert.equal(result.next_message_id, nextId);
+    assert.equal(result.traversed_from, "2026-08-30T00:00:00.000Z");
+    assert.equal(result.coverage.oldest_message_at, "2026-08-01T00:00:00.000Z");
     assert.equal(result.coverage.completeness, "unknown");
-    assert.equal(f.store.historyCoverage(f.chat.id).stored_messages, 3);
+    assert.equal(result.messages_added, 2);
+    const sender = {
+      connected: true,
+      ownerIds: [],
+      send: async () => {
+        throw new Error("Sends forbidden");
+      },
+    };
+    const p = {
+      id: "agent",
+      name: "Agent",
+      tokenHash: hash("key"),
+      canDraft: false,
+      canSend: false,
+      enabled: true,
+    };
+    f.store.put("client", p.id, p);
+    const resultRead = new Service(f.store, sender).read(p, {
+      chat_ids: [f.chat.id],
+      sent_at: september,
+      query: "2026-09-20",
+    });
+    assert.equal(resultRead.messages.length, 1);
+    assert.equal(resultRead.chat_coverage?.[0]?.stored_messages, 4);
     sync.close();
-    const next = new HistorySync(f.store, {
+    const restarted = new HistorySync(f.store, {
       connected: () => false,
       request: async () => {
         throw new Error();
       },
     });
-    assert.equal(next.get(job.id).messages_added, 2);
-    next.close();
+    assert.equal(restarted.get(job.id).traversed_from, result.traversed_from);
+    restarted.close();
   } finally {
     sync.close();
     f.close();
   }
 });
-test("unrelated notifications cannot complete a job and a hung dispatch has a bounded timeout", async () => {
+
+test("delayed chunks keep the job running beyond 750ms until explicit matching completion", async () => {
   const f = fixture();
-  const sync = new HistorySync(
-    f.store,
-    { connected: () => true, request: () => new Promise(() => {}) },
-    20,
-  );
-  try {
-    const job = sync.start({ chat_id: f.chat.id });
-    await delay(1);
-    sync.received({ chats: ["unrelated"] });
-    assert.equal((await terminal(sync, job.id)).state, "timed_out");
-  } finally {
-    sync.close();
-    f.close();
-  }
-});
-test("duplicate history reports no progress, never exhausted, and restart marks unfinished jobs interrupted", async () => {
-  const f = fixture();
+  const anchor = f.ingest("2026-10-01T00:00:00Z");
   let sync!: HistorySync;
-  f.ingest("2026-10-01T00:00:00Z");
+  const timers: ReturnType<typeof setTimeout>[] = [];
   sync = new HistorySync(
     f.store,
     {
       connected: () => true,
-      request: async (chat) => {
-        sync.received({ chats: [chat] });
-        return { requestId: "duplicate" };
+      request: async () => {
+        sync.received({
+          requestId: "chunked",
+          progress: 10,
+          messages: [{ ...anchor, added: false }],
+        });
+        timers.push(
+          setTimeout(
+            () =>
+              sync.received({
+                requestId: "chunked",
+                progress: 70,
+                messages: [f.ingest("2026-08-30T00:00:00Z")],
+              }),
+            900,
+          ),
+        );
+        return { requestId: "chunked" };
+      },
+    },
+    2000,
+  );
+  try {
+    const job = sync.start({ chat_id: f.chat.id, sent_at: september });
+    await delay(800);
+    assert.equal(sync.get(job.id).state, "running");
+    for (let n = 0; sync.get(job.id).response_progress !== 70 && n < 200; n++)
+      await delay(5);
+    const pending = sync.get(job.id);
+    assert.equal(pending.state, "running");
+    assert.equal(pending.response_progress, 70);
+    assert.equal(pending.messages_added, 1);
+    sync.received({ requestId: "chunked", progress: 100, messages: [] });
+    const result = await terminal(sync, job.id);
+    assert.equal(result.state, "target_reached");
+    assert.equal(result.messages_added, 1);
+  } finally {
+    timers.forEach(clearTimeout);
+    sync.close();
+    f.close();
+  }
+});
+
+test("wrong early request IDs and uncorrelated chunks never satisfy a request", async () => {
+  const f = fixture();
+  f.ingest("2026-10-01T00:00:00Z");
+  let sync!: HistorySync;
+  sync = new HistorySync(
+    f.store,
+    {
+      connected: () => true,
+      request: async () => {
+        const message = f.ingest("2026-08-01T00:00:00Z");
+        sync.received({
+          requestId: "wrong",
+          progress: 100,
+          messages: [message],
+        });
+        sync.received({ progress: 100, messages: [message] });
+        return { requestId: "expected" };
+      },
+    },
+    30,
+  );
+  try {
+    const result = await terminal(sync, sync.start({ chat_id: f.chat.id }).id);
+    assert.equal(result.state, "timed_out");
+    assert.equal(result.messages_added, 0);
+    assert.equal(result.traversed_from, null);
+    assert.equal(result.traversed_to, null);
+  } finally {
+    sync.close();
+    f.close();
+  }
+});
+
+test("correct empty early completion is no progress and missing completion is explicitly incomplete", async () => {
+  const f = fixture();
+  f.ingest("2026-10-01T00:00:00Z");
+  let sync!: HistorySync;
+  sync = new HistorySync(
+    f.store,
+    {
+      connected: () => true,
+      request: async () => {
+        sync.received({ requestId: "empty", progress: 100, messages: [] });
+        return { requestId: "empty" };
       },
     },
     30,
@@ -140,101 +246,202 @@ test("duplicate history reports no progress, never exhausted, and restart marks 
       (await terminal(sync, sync.start({ chat_id: f.chat.id }).id)).state,
       "no_progress",
     );
-    const persisted = sync.start({ chat_id: f.chat.id });
     sync.close();
-    assert.equal(sync.get(persisted.id).state, "interrupted");
-    const next = new HistorySync(f.store, {
-      connected: () => false,
-      request: async () => {
-        throw new Error();
+    sync = new HistorySync(
+      f.store,
+      {
+        connected: () => true,
+        request: async () => {
+          f.ingest("2026-07-01T00:00:00Z"); // unrelated live/store growth must not count as this response
+          sync.received({
+            requestId: "partial",
+            progress: 25,
+            messages: [f.ingest("2026-09-01T00:00:00Z")],
+          });
+          return { requestId: "partial" };
+        },
       },
-    });
-    assert.equal(next.get(persisted.id).state, "interrupted");
-    next.close();
+      30,
+    );
+    const job = await terminal(sync, sync.start({ chat_id: f.chat.id }).id);
+    assert.equal(job.state, "response_incomplete");
+    assert.equal(job.messages_added, 1);
+    assert.equal(job.traversed_from, null);
+    assert.equal(job.traversed_to, null);
   } finally {
     sync.close();
     f.close();
   }
 });
-test("no raw anchor is explicit, timestamp is milliseconds, and a usable raw message anchors the request", async () => {
+
+test("dispatch deadlines, service interruption, and offline jobs do not silently retry", async () => {
+  const f = fixture();
+  f.ingest("2026-10-01T00:00:00Z");
+  let sync = new HistorySync(
+    f.store,
+    { connected: () => true, request: () => new Promise(() => {}) },
+    20,
+  );
+  try {
+    assert.equal(
+      (await terminal(sync, sync.start({ chat_id: f.chat.id }).id)).state,
+      "timed_out",
+    );
+    const queued = sync.start({ chat_id: f.chat.id });
+    sync.close();
+    assert.equal(sync.get(queued.id).state, "interrupted");
+    sync = new HistorySync(f.store, {
+      connected: () => false,
+      request: async () => {
+        throw new Error("Unexpected dispatch");
+      },
+    });
+    assert.equal(sync.get(queued.id).state, "interrupted");
+    assert.equal(
+      (await terminal(sync, sync.start({ chat_id: f.chat.id }).id)).state,
+      "offline",
+    );
+  } finally {
+    sync.close();
+    f.close();
+  }
+});
+
+test("only usable scoped anchors are dispatched, timestamps use milliseconds, and budgets are enforced", async () => {
   const f = fixture();
   try {
     f.wa.connected = true;
+    let calls = 0;
     f.wa.socket = {
       fetchMessageHistory: async (
         _count: number,
         key: { remoteJid?: string | null },
         timestamp: number,
       ) => {
+        calls++;
         assert.equal(key.remoteJid, f.chat.jid);
         assert.equal(timestamp, Date.parse("2026-10-01T00:00:00Z"));
-        return "real-key";
+        return "wire-key";
       },
     } as unknown as NonNullable<WhatsApp["socket"]>;
-    const empty = f.wa.history.start({ chat_id: f.chat.id });
-    const missing = await terminal(f.wa.history, empty.id);
+    const missing = await terminal(
+      f.wa.history,
+      f.wa.history.start({ chat_id: f.chat.id }).id,
+    );
     assert.equal(missing.state, "no_anchor");
-    assert.equal(missing.batches_requested, 0);
-    f.ingest("2026-10-01T00:00:00Z");
+    assert.equal(calls, 0);
+    const anchor = f.ingest("2026-10-01T00:00:00Z");
     assert.equal(
-      (await f.wa.requestHistory(f.chat.id, 50)).requestId,
-      "real-key",
+      (await f.wa.requestHistory(f.chat.id, 50, anchor.id)).requestId,
+      "wire-key",
+    );
+    assert.throws(() =>
+      f.wa.history.start({ chat_id: f.chat.id, max_batches: 11 }),
+    );
+    assert.throws(() =>
+      f.wa.history.start({
+        chat_id: f.chat.id,
+        sent_at: { from: september.to, to: september.from },
+      }),
     );
   } finally {
     f.wa.socket = undefined;
     f.close();
   }
 });
-test("MCP search backfills only with explicit one-chat scope, exposes progress, and enforces revocation", async () => {
+
+test("a completed batch advances a cursor even when all its messages were already stored", async () => {
+  const f = fixture();
+  const old = f.ingest("2026-09-20T00:00:00Z"),
+    anchor = f.ingest("2026-10-01T00:00:00Z");
+  let sync!: HistorySync;
+  sync = new HistorySync(
+    f.store,
+    {
+      connected: () => true,
+      request: async () => {
+        sync.received({
+          requestId: "stored",
+          progress: 100,
+          messages: [{ ...old, added: false }],
+        });
+        return { requestId: "stored" };
+      },
+    },
+    30,
+  );
+  try {
+    const result = await terminal(
+      sync,
+      sync.start({
+        chat_id: f.chat.id,
+        before_message_id: anchor.id,
+        max_batches: 1,
+      }).id,
+    );
+    assert.equal(result.state, "batch_limit");
+    assert.equal(result.next_message_id, old.id);
+    assert.equal(result.messages_added, 0);
+  } finally {
+    sync.close();
+    f.close();
+  }
+});
+
+test("MCP reads/searches stay local, coverage is included, explicit sync reports status and revocation is enforced", async () => {
   const f = fixture();
   const p = {
     id: "agent",
     name: "Agent",
     tokenHash: hash("key"),
-    canDraft: true,
+    canDraft: false,
     canSend: false,
     enabled: true,
   };
   f.store.put("client", p.id, p);
   f.ingest("2026-10-01T00:00:00Z");
-  const service = new Service(f.store, f.wa);
-  const server = createMcp(service, f.wa, p);
+  const server = createMcp(new Service(f.store, f.wa), f.wa, p);
   const client = new Client({ name: "test", version: "1" });
   const [a, b] = InMemoryTransport.createLinkedPair();
   await server.connect(a);
   await client.connect(b);
   const call = async (name: string, args: Record<string, unknown>) => {
     const result = await client.callTool({ name, arguments: args });
-    return JSON.parse(
-      (result.content as { type: string; text: string }[])[0]!.text,
-    );
+    const content = result.content;
+    assert.ok(Array.isArray(content));
+    const text = content.find((item) => item.type === "text");
+    assert.ok(text && text.type === "text");
+    return JSON.parse(text.text);
   };
   try {
+    const tools = (await client.listTools()).tools;
     assert.equal(
-      (await call("search_messages", { query: "older", fetch_history: true }))
-        .code,
-      "invalid_argument",
+      tools.some((t) => t.name === "get_history_coverage"),
+      false,
     );
-    const result = await call("search_messages", {
+    const oldOption = await call("search_messages", {
       query: "older",
-      chat_ids: [f.chat.id],
       fetch_history: true,
     });
-    assert.equal(result.results_scope, "local_so_far");
-    const job = await terminal(f.wa.history, result.history_sync.id);
-    assert.equal(job.state, "offline");
+    assert.ok(Array.isArray(oldOption.messages));
+    assert.equal(f.store.all("history-job").length, 0);
+    const local = await call("search_messages", {
+      query: "older",
+      chat_ids: [f.chat.id],
+    });
+    assert.equal(local.messages.length, 0);
+    assert.equal(local.chat_coverage[0].stored_messages, 1);
+    assert.equal(f.store.all("history-job").length, 0);
+    const queued = await call("sync_history", { chat_id: f.chat.id });
+    const result = await terminal(f.wa.history, queued.id);
+    assert.equal(result.state, "offline");
     assert.equal(
-      (await call("get_history_coverage", { chat_id: f.chat.id }))
-        .stored_messages,
-      1,
-    );
-    assert.equal(
-      (await call("get_history_status", { job_id: job.id })).state,
+      (await call("get_history_status", { job_id: result.id })).state,
       "offline",
     );
     f.store.put("client", p.id, { ...p, enabled: false });
     assert.equal(
-      (await call("get_history_status", { job_id: job.id })).code,
+      (await call("get_history_status", { job_id: result.id })).code,
       "not_found_or_not_permitted",
     );
   } finally {
@@ -244,7 +451,7 @@ test("MCP search backfills only with explicit one-chat scope, exposes progress, 
   }
 });
 
-test("broader sync defaults apply to new pairings without changing existing linked-device profiles", () => {
+test("broader initial sync preserves existing linked-device profiles", () => {
   assert.equal(
     resolveHistoryMode({ saved: undefined, paired: false }),
     "desktop",
@@ -266,84 +473,72 @@ test("broader sync defaults apply to new pairings without changing existing link
   );
 });
 
-test("batch budgets stop pagination, invalid ranges are rejected, and wrong request IDs cannot complete jobs", async () => {
+test("history ingestion does not count verified identity reconciliation as newly fetched messages", () => {
   const f = fixture();
-  f.ingest("2026-10-20T00:00:00Z");
-  let sync: HistorySync;
-  sync = new HistorySync(
-    f.store,
-    {
-      connected: () => true,
-      request: async (chat) => {
-        f.ingest("2026-09-20T00:00:00Z");
-        sync.received({ chats: [chat] });
-        return { requestId: "one-batch" };
-      },
-    },
-    50,
-  );
   try {
-    assert.throws(() => sync.start({ chat_id: f.chat.id, max_batches: 11 }));
-    assert.throws(() =>
-      sync.start({
-        chat_id: f.chat.id,
-        sent_at: { from: "2026-10-20T00:00:00Z", to: "2026-09-20T00:00:00Z" },
-      }),
+    const pn = "222@s.whatsapp.net",
+      lid = "333@lid";
+    const base = {
+      messageTimestamp: Date.parse("2026-10-01T00:00:00Z") / 1000,
+      message: { conversation: "same message" },
+    };
+    assert.equal(
+      f.wa.ingest(
+        { ...base, key: { remoteJid: pn, fromMe: false, id: "same" } },
+        "history",
+      )?.added,
+      true,
     );
-    const job = await terminal(
-      sync,
-      sync.start({ chat_id: f.chat.id, max_batches: 1 }).id,
+    assert.equal(
+      f.wa.ingest(
+        {
+          ...base,
+          key: { remoteJid: lid, remoteJidAlt: pn, fromMe: false, id: "same" },
+        },
+        "history",
+      )?.added,
+      false,
     );
-    assert.equal(job.state, "batch_limit");
-    assert.equal(job.batches_requested, 1);
-    const already = await terminal(
-      sync,
-      sync.start({
-        chat_id: f.chat.id,
-        sent_at: { from: "2026-10-01T00:00:00Z", to: "2026-10-02T00:00:00Z" },
-      }).id,
-    );
-    assert.equal(already.state, "target_reached");
-    assert.equal(already.batches_requested, 0);
-    sync.close();
-    sync = new HistorySync(
-      f.store,
-      {
-        connected: () => true,
-        request: async () => ({ requestId: "expected" }),
-      },
-      30,
-    );
-    const mismatched = sync.start({ chat_id: f.chat.id });
-    await delay(5);
-    sync.received({ chats: [f.chat.id], requestId: "wrong" });
-    assert.equal((await terminal(sync, mismatched.id)).state, "timed_out");
   } finally {
-    sync.close();
     f.close();
   }
 });
 
-test("an empty correlated response arriving before dispatch returns is no progress, not a timeout", async () => {
+test("same-second response messages advance by their actual key without requiring lexicographically smaller IDs", async () => {
   const f = fixture();
-  f.ingest("2026-10-20T00:00:00Z");
-  let sync: HistorySync;
+  const first = f.ingest("2026-10-01T00:00:00Z", "first"),
+    second = f.ingest("2026-10-01T00:00:00Z", "second");
+  const [anchor, earlier] = [first, second].sort((a, b) =>
+    a.id.localeCompare(b.id),
+  );
+  assert.ok(anchor && earlier);
+  let sync!: HistorySync;
   sync = new HistorySync(
     f.store,
     {
       connected: () => true,
       request: async () => {
-        sync.received({ chats: [], requestId: "early-empty" });
-        return { requestId: "early-empty" };
+        sync.received({
+          requestId: "same-second",
+          progress: 100,
+          messages: [{ ...earlier, added: false }],
+        });
+        return { requestId: "same-second" };
       },
     },
-    100,
+    30,
   );
   try {
-    assert.equal(
-      (await terminal(sync, sync.start({ chat_id: f.chat.id }).id)).state,
-      "no_progress",
+    const job = await terminal(
+      sync,
+      sync.start({
+        chat_id: f.chat.id,
+        before_message_id: anchor.id,
+        max_batches: 1,
+      }).id,
     );
+    assert.equal(job.state, "batch_limit");
+    assert.equal(job.next_message_id, earlier.id);
   } finally {
     sync.close();
     f.close();
