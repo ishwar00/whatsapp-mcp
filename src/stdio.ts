@@ -13,6 +13,8 @@ import { pathToFileURL } from "node:url";
 
 const readTools = new Set([
   "get_status",
+  "get_history_status",
+  "get_history_coverage",
   "list_chats",
   "list_participants",
   "read_messages",
@@ -85,7 +87,8 @@ export function createStdioProxy(url: string, token: string) {
               signal: extra.signal,
               timeout: 150_000,
             }),
-          readTools.has(request.params.name),
+          readTools.has(request.params.name) &&
+            request.params.arguments?.fetch_history !== true,
         );
       }
     });

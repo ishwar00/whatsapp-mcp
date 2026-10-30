@@ -1030,6 +1030,23 @@ test("adapter reconnects expired reads once and never automatically replays a se
         (tool) => tool.name === "send_draft",
       ),
     );
+    await expireSession();
+    await assert.rejects(
+      client.callTool({
+        name: "read_messages",
+        arguments: { chat_ids: [f.a.id], fetch_history: true },
+      }),
+      /404/,
+    );
+    assert.equal(calls.filter((name) => name === "read_messages").length, 1);
+    await status();
+    await expireSession();
+    await assert.rejects(
+      client.callTool({ name: "sync_history", arguments: { chat_id: f.a.id } }),
+      /404/,
+    );
+    assert.equal(calls.filter((name) => name === "sync_history").length, 1);
+    await status();
     const draft = f.service.createDraft(f.p, {
       chat_id: f.a.id,
       text: "Recovery test",

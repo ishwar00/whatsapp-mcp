@@ -345,6 +345,44 @@ export class Store {
         this.eraseMessage(message.id);
     }
   }
+  historyCoverage(chatId?: string) {
+    const id = chatId ? this.chat(chatId).id : null;
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS count, min(sent) AS oldest, max(sent) AS newest
+      FROM messages WHERE json_extract(value,'$.deleted')=0 AND sent IS NOT NULL
+      ${id ? "AND chat=?" : ""}`,
+      )
+      .get(...(id ? [id] : []));
+    const result = z
+      .object({
+        count: z.number(),
+        oldest: z.string().nullable(),
+        newest: z.string().nullable(),
+      })
+      .parse(row);
+    return {
+      chat_id: id,
+      stored_messages: result.count,
+      oldest_message_at: result.oldest,
+      newest_message_at: result.newest,
+      completeness: "unknown",
+      gaps: "unknown",
+    };
+  }
+  historyAnchor(chatId: string) {
+    const chat = this.chat(chatId);
+    const row = this.db
+      .prepare(
+        `SELECT m.value FROM messages m JOIN objects r ON r.kind='raw' AND r.id=m.id
+      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL
+      ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`,
+      )
+      .get(chat.id);
+    return row
+      ? messageSchema.parse(JSON.parse(rowSchema.parse(row).value))
+      : null;
+  }
   prune(days = 90) {
     const cutoff = new Date(Date.now() - days * 86400000).toISOString();
     for (const row of this.db

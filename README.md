@@ -199,6 +199,46 @@ not just a prompt instruction, to enforce review. Accepted means provider
 acceptance, not delivery. An uncertain or accepted draft is never automatically
 resent; inspect WhatsApp before making a replacement draft.
 
+## Load older conversations
+
+Ask your agent to "load the September conversation in this chat" or "search older
+messages for the DNS change". The service stores retrieved history so every connected
+agent can reuse it.
+
+- `get_history_coverage` shows stored message dates and count for a chat. These are
+  bounds, not proof that every message between them is present.
+- `sync_history` takes `chat_id`, an optional `sent_at` date range, and `max_batches`
+  from 1 to 10, default 3. Each batch requests 50 messages before the oldest stored
+  raw message. With a range, it stops when the oldest stored date reaches `from`.
+  `to` describes the intended read range; it does not make WhatsApp jump to that date.
+- Poll `get_history_status` using the returned `id` as `job_id`, then read or search
+  the requested range. Jobs survive client disconnects. A service restart marks
+  unfinished jobs `interrupted`; it does not silently retry them.
+- `read_messages` and `search_messages` accept `fetch_history: true` and
+  `max_history_batches` when exactly one chat is selected and no page cursor is used.
+  They return local results immediately plus a background job. Poll it, then repeat
+  the query without `fetch_history` or a page cursor to include arriving messages.
+
+Terminal outcomes distinguish `target_reached`, `batch_limit`, `no_progress`,
+`timed_out`, `no_anchor`, `offline`, `failed`, and `interrupted`. None proves that
+WhatsApp has no older messages. Duplicate responses stop automatic pagination.
+Requests are serialized, and an active request for the same chat is shared. If
+another request joins it, inspect the returned job's date range and batch budget.
+
+A batch waits up to 30 seconds for a matching history event. A submitted request
+alone is not success. The phone must be able to respond. Chats with no stored raw
+message need initial history or a new message before they have a usable anchor.
+
+New pairings use Baileys' desktop profile with `syncFullHistory: true` to request
+broader initial history. Existing pairings keep their previous profile, which is
+saved across restarts. Set `WHATSAPP_HISTORY_MODE=recent` on the service for the
+lighter sync mode. Changing an existing pairing to `desktop` may prevent it from
+connecting, and does not guarantee a new full import. Use a fresh pairing if you
+need to change device profile. `get_status.history_sync` reports the configured mode and last
+history event or phase. Scrolling a separate WhatsApp Web session does not populate
+this service. Disappearing, deleted, expired, and view-once content still follows
+the existing retention rules.
+
 ## Data and operation
 
 - Messages and attachment bytes are stored locally in `.data/bridge.sqlite`.
@@ -225,6 +265,7 @@ resent; inspect WhatsApp before making a replacement draft.
 |---|---|---|
 | `BRIDGE_DATA_DIR` | `.data` relative to the working directory | Service and owner commands |
 | `BRIDGE_PORT` | `3210` | Service and owner commands |
+| `WHATSAPP_HISTORY_MODE` | `desktop` for new pairings; saved profile for existing pairings | Service |
 | `WHATSAPP_BRIDGE_TOKEN` | Required | Stdio adapter |
 | `WHATSAPP_BRIDGE_URL` | `http://127.0.0.1:3210/mcp` | Stdio adapter |
 

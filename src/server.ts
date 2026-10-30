@@ -9,6 +9,7 @@ import { z } from "zod";
 import { Service } from "./service.js";
 import { BridgeError } from "./domain.js";
 import { createMcp } from "./mcp.js";
+import { historyInput } from "./history.js";
 import type { WhatsApp } from "./whatsapp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 const secret = () => randomBytes(32).toString("base64url");
@@ -176,14 +177,8 @@ export function createApp(
     res.json({ state: wa.state, qr: wa.qr });
   });
   app.post("/owner/history", async (req, res) => {
-    const input = z
-      .object({
-        chat_id: z.string(),
-        count: z.number().int().min(1).max(100).default(50),
-      })
-      .strict()
-      .parse(req.body);
-    res.json(await wa.requestHistory(input.chat_id, input.count));
+    const input = historyInput.parse(req.body);
+    res.json(wa.history.start(input));
   });
   app.post("/owner/clients", (req, res) => {
     const q = z

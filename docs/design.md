@@ -35,6 +35,22 @@ Old IDs redirect to the retained row, so drafts and reply references survive. A
 deletion wins over duplicate content; otherwise the latest edit wins. Attachments
 move to the retained message before the losing message is deleted.
 
+## History retrieval
+
+`history.ts` owns a bounded queue of persisted per-chat history jobs. MCP callers
+start a job and poll its state while `whatsapp.ts` requests batches from the phone.
+Incoming history is ingested through the same message, identity, edit, and media
+paths as other messages. Matching history events wake the job; request submission
+alone does not mean messages arrived. Timeouts and no-progress responses stop it.
+
+Jobs use the oldest usable raw message as an anchor. Date targets stop pagination
+once the stored oldest date reaches the requested start; they do not prove there
+are no gaps. Retrieved messages are shared by all local clients through SQLite.
+The owner history endpoint uses the same queue and job format as MCP.
+
+New pairings request desktop/full history. Existing pairings preserve their device
+profile, saved across restarts, because changing it can prevent reconnection.
+
 ## Access and approval
 
 Agent bearer keys can read all chats. Draft and send permissions are separate.

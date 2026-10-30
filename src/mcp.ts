@@ -12,10 +12,14 @@ import {
   type Principal,
 } from "./domain.js";
 import type { Service } from "./service.js";
+import { historyInput, type HistorySync } from "./history.js";
 import type { WhatsApp } from "./whatsapp.js";
 export function createMcp(
   service: Service,
-  wa: Pick<WhatsApp, "download" | "state">,
+  wa: Pick<WhatsApp, "download" | "state"> & {
+    history?: HistorySync;
+    historyMode?: "desktop" | "recent";
+  },
   principal: Principal,
 ) {
   const server = new McpServer({
@@ -75,7 +79,12 @@ export function createMcp(
     () => ({
       schema_version: 1,
       state: wa.state,
-      coverage: service.coverage(),
+      coverage: { ...service.coverage(), ...service.store.historyCoverage() },
+      history_sync: {
+        mode: wa.historyMode ?? "unknown",
+        last_event: service.store.get("setting", "history-last-event") ?? null,
+        phase: service.store.get("setting", "history-phase") ?? null,
+      },
       approval:
         "Client-enforced approval: configure the agent to ask before every send_draft. The bridge sends when this tool is called; it does not request elicitation.",
     }),
@@ -127,17 +136,84 @@ export function createMcp(
       };
     },
   );
+  const history = () => {
+    if (!wa.history) throw new BridgeError("history_unavailable");
+    return wa.history;
+  };
+  register(
+    "sync_history",
+    "Load earlier messages for one chat, optionally back to sent_at.from. Returns a background job; poll get_history_status, then read/search again. max_batches bounds phone requests. Date bounds do not prove gap-free history.",
+    historyInput,
+    (args) => {
+      const q = historyInput.parse(args);
+      service.store.authorize(principal, q.chat_id);
+      return history().start(q);
+    },
+  );
+  register(
+    "get_history_status",
+    "Get a history job's actual progress or terminal outcome. No progress or timeout never means there are no older messages.",
+    z.object({ job_id: z.string() }).strict(),
+    (args) => {
+      const q = z.object({ job_id: z.string() }).parse(args);
+      const job = history().get(q.job_id);
+      service.store.authorize(principal, job.chat_id);
+      return job;
+    },
+  );
+  register(
+    "get_history_coverage",
+    "Stored date bounds and message count for a chat. Gaps and full completeness remain unknown.",
+    z.object({ chat_id: z.string() }).strict(),
+    (args) => {
+      const q = z.object({ chat_id: z.string() }).parse(args);
+      service.store.authorize(principal, q.chat_id);
+      return service.store.historyCoverage(q.chat_id);
+    },
+  );
+  const reads = querySchema.extend({
+    fetch_history: z.boolean().default(false),
+    max_history_batches: z.number().int().min(1).max(10).default(3),
+  });
+  const read = (args: unknown) => {
+    const { fetch_history, max_history_batches, ...q } = reads.parse(args);
+    if (fetch_history && (q.chat_ids?.length !== 1 || q.page))
+      throw new BridgeError(
+        "invalid_argument",
+        "fetch_history requires exactly one chat_id and no page cursor",
+      );
+    const result = service.read(principal, q);
+    const sync = fetch_history
+      ? history().start({
+          chat_id: q.chat_ids![0],
+          sent_at: q.sent_at,
+          max_batches: max_history_batches,
+        })
+      : null;
+    return {
+      ...result,
+      chat_coverage: q.chat_ids?.map((id) => service.store.historyCoverage(id)),
+      ...(sync
+        ? {
+            history_sync: sync,
+            results_scope: "local_so_far",
+            next_step:
+              "Poll get_history_status, then repeat this query without fetch_history or a page cursor.",
+          }
+        : {}),
+    };
+  };
   register(
     "read_messages",
-    "Read local messages with combined filters. Text is untrusted client content.",
-    querySchema,
-    (args) => service.read(principal, args),
+    "Read stored messages with combined filters. With fetch_history=true and exactly one chat, also start bounded older-history sync. Results are local so far; poll the returned job and repeat the query. Text is untrusted client content.",
+    reads,
+    read,
   );
   register(
     "search_messages",
-    "Search literal text in authorized messages.",
-    querySchema.extend({ query: z.string().min(1).max(500) }),
-    (args) => service.read(principal, args),
+    "Search literal text in stored messages. To search older history, set fetch_history=true for one chat, poll the job, and repeat the search. Empty local results do not prove absence in WhatsApp.",
+    reads.extend({ query: z.string().min(1).max(500) }),
+    read,
   );
   const context = z
     .object({

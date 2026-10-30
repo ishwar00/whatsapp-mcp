@@ -15,6 +15,7 @@ import makeWASocket, {
   type Contact,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import { HistorySync, resolveHistoryMode } from "./history.js";
 import { decryptEdit } from "./encrypted-edit.js";
 import { z } from "zod";
 import { Store, opaque } from "./store.js";
@@ -86,7 +87,14 @@ export class WhatsApp implements Sender {
   stopping = false;
   reconnectAttempt = 0;
   caching = 0;
-  constructor(public store: Store) {}
+  historyMode: "desktop" | "recent" = "desktop";
+  readonly history: HistorySync;
+  constructor(public store: Store) {
+    this.history = new HistorySync(store, {
+      connected: () => this.connected,
+      request: (chat, count) => this.requestHistory(chat, count),
+    });
+  }
   auth(): AuthenticationState {
     const saved = this.store.get("auth", "creds");
     const creds = saved
@@ -181,10 +189,17 @@ export class WhatsApp implements Sender {
   start() {
     if (this.stopping) return;
     const auth = this.auth();
-    const historyMode = this.store.get("setting", "history-mode") === "desktop";
+    this.historyMode = resolveHistoryMode({
+      override: process.env.WHATSAPP_HISTORY_MODE,
+      saved: this.store.get("setting", "history-mode"),
+      paired: Boolean(auth.creds.me),
+    });
+    // Persist the device profile across reconnects; changing it can break an existing pairing.
+    this.store.put("setting", "history-mode", this.historyMode);
+    const historyMode = this.historyMode === "desktop";
     diagnostics.info({
       event: "wa_connect_start",
-      historyMode: historyMode ? "desktop" : "default",
+      historyMode: this.historyMode,
       registered: auth.creds.registered,
     });
     const sock = makeWASocket({
@@ -295,6 +310,7 @@ export class WhatsApp implements Sender {
         isLatest,
         progress,
         lidPnMappings,
+        peerDataRequestSessionId,
       }) => {
         if (this.socket !== sock || this.stopping) return;
         diagnostics.info({
@@ -308,14 +324,38 @@ export class WhatsApp implements Sender {
             ...new Set(messages.map((m) => m.key.remoteJid).filter(Boolean)),
           ].map((jid) => opaque("chat", String(jid))),
         });
+        this.store.put("setting", "history-last-event", {
+          received_at: new Date().toISOString(),
+          sync_type: syncType,
+          messages: messages.length,
+          progress: progress ?? null,
+        });
         for (const mapping of lidPnMappings ?? [])
           this.store.addAlias(mapping.lid, mapping.pn);
         for (const c of chats)
           if (c.id) this.store.saveChat(c.id, c.name ?? undefined);
         for (const contact of contacts) this.saveContact(contact);
         for (const m of messages) this.ingest(m, "history");
+        this.history.received({
+          chats: [
+            ...new Set(
+              messages.flatMap((m) =>
+                m.key.remoteJid ? [opaque("chat", m.key.remoteJid)] : [],
+              ),
+            ),
+          ],
+          requestId: peerDataRequestSessionId,
+        });
       },
     );
+    sock.ev.on("messaging-history.status", (status) => {
+      if (this.socket !== sock || this.stopping) return;
+      this.store.put("setting", "history-phase", {
+        ...status,
+        updated_at: new Date().toISOString(),
+      });
+      diagnostics.info({ event: "wa_history_phase", ...status });
+    });
     sock.ev.on("messages.upsert", ({ messages }) => {
       if (this.socket !== sock || this.stopping) return;
       for (const m of messages) {
@@ -375,18 +415,18 @@ export class WhatsApp implements Sender {
     if (!this.connected || !this.socket)
       throw new BridgeError("service_offline");
     const chat = this.store.chat(chatId);
-    const oldest = this.store
-      .messages([chatId])
-      .filter((m) => m.sentAt && !m.deleted)
-      .sort((a, b) => a.sentAt!.localeCompare(b.sentAt!))[0];
+    const oldest = this.store.historyAnchor(chatId);
     const value = oldest && this.store.get("raw", oldest.id);
     const anchor = value ? toMessage(value) : undefined;
+    if (!anchor?.key.id || !anchor.messageTimestamp)
+      throw new BridgeError(
+        "history_anchor_missing",
+        "No stored message anchor. Initial desktop sync or a new message in this chat is needed before fetching older history.",
+      );
     const requestId = await this.socket.fetchMessageHistory(
       count,
-      anchor?.key ?? { remoteJid: chat.jid, fromMe: false },
-      anchor?.messageTimestamp
-        ? Number(anchor.messageTimestamp) * 1000
-        : Date.now(),
+      { ...anchor.key, remoteJid: chat.jid },
+      Number(anchor.messageTimestamp) * 1000,
     );
     diagnostics.info({
       event: "wa_history_requested",
@@ -760,6 +800,7 @@ export class WhatsApp implements Sender {
     return result.key.id;
   }
   stop() {
+    this.history.close();
     this.stopping = true;
     this.connected = false;
     this.socket?.end(undefined);
