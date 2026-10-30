@@ -18,7 +18,7 @@ export function createMcp(
   service: Service,
   wa: Pick<WhatsApp, "download" | "state"> & {
     history?: HistorySync;
-    historyMode?: "desktop" | "recent";
+    historyMode?: WhatsApp["historyMode"];
   },
   principal: Principal,
 ) {

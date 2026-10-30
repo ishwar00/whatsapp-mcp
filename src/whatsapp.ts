@@ -1,6 +1,5 @@
 import makeWASocket, {
   BufferJSON,
-  Browsers,
   DisconnectReason,
   initAuthCreds,
   proto,
@@ -48,7 +47,7 @@ export class WhatsApp implements Sender {
   stopping = false;
   reconnectAttempt = 0;
   caching = 0;
-  historyMode: "desktop" | "recent" = "desktop";
+  historyMode: "full" | "recent" = "full";
   readonly history: HistorySync;
   constructor(public store: Store) {
     this.history = new HistorySync(store, {
@@ -157,9 +156,9 @@ export class WhatsApp implements Sender {
       saved: this.store.get("setting", "history-mode"),
       paired: Boolean(auth.creds.me),
     });
-    // Persist the device profile across reconnects; changing it can break an existing pairing.
+    // Persist the sync preference without changing the paired browser identity.
     this.store.put("setting", "history-mode", this.historyMode);
-    const historyMode = this.historyMode === "desktop";
+    const historyMode = this.historyMode === "full";
     diagnostics.info({
       event: "wa_connect_start",
       historyMode: this.historyMode,
@@ -169,9 +168,7 @@ export class WhatsApp implements Sender {
       auth,
       logger,
       markOnlineOnConnect: false,
-      ...(historyMode
-        ? { browser: Browsers.macOS("Desktop"), syncFullHistory: true }
-        : { syncFullHistory: false }),
+      syncFullHistory: historyMode,
       generateHighQualityLinkPreview: false,
       getMessage: async (key) => {
         if (!key.remoteJid || !key.id) return undefined;
@@ -384,7 +381,7 @@ export class WhatsApp implements Sender {
     if (!anchor?.key.id || !anchor.messageTimestamp)
       throw new BridgeError(
         "history_anchor_missing",
-        "No stored message anchor. Initial desktop sync or a new message in this chat is needed before fetching older history.",
+        "No stored message anchor. Initial history sync or a new message in this chat is needed before fetching older history.",
       );
     const requestId = await this.socket.fetchMessageHistory(
       count,

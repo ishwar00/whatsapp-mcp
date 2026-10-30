@@ -376,7 +376,9 @@ export class Store {
   ) {
     const chat = this.chat(chatId);
     const base = `SELECT m.value FROM messages m JOIN objects r ON r.kind='raw' AND r.id=m.id
-      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL`;
+      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL
+      AND EXISTS (SELECT 1 FROM json_each(r.value,'$.message') field
+        WHERE field.key NOT IN ('messageContextInfo','senderKeyDistributionMessage'))`;
     let row;
     if (options.messageId) {
       row = this.db

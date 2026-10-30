@@ -244,13 +244,12 @@ disconnects; a service restart marks unfinished jobs `interrupted` without retry
 them. The phone must be able to respond. Chats with no usable stored raw message
 need initial history or a new message before they can fetch earlier messages.
 
-New pairings use Baileys' desktop profile with `syncFullHistory: true` to request
-broader initial history. Existing pairings keep their previous profile, which is
-saved across restarts. Set `WHATSAPP_HISTORY_MODE=recent` on the service for the
-lighter sync mode. Changing an existing pairing to `desktop` may prevent it from
-connecting, and does not guarantee a new full import. Use a fresh pairing if you
-need to change device profile. `get_status.history_sync` reports the configured mode and last
-history event or phase. Scrolling a separate WhatsApp Web session does not populate
+New pairings request `syncFullHistory: true` using Baileys' default Chrome
+profile. Existing pairings keep their saved sync preference. Set
+`WHATSAPP_HISTORY_MODE=recent` for lighter initial sync, or `full` to request
+broader history. Both modes keep the same browser identity. WhatsApp decides how
+much history it shares; full mode does not guarantee every older message.
+`get_status.history_sync` reports the configured mode and last history event or phase. Scrolling a separate WhatsApp Web session does not populate
 this service. Disappearing, deleted, expired, and view-once content still follows
 the existing retention rules.
 
@@ -280,7 +279,7 @@ the existing retention rules.
 |---|---|---|
 | `BRIDGE_DATA_DIR` | `.data` relative to the working directory | Service and owner commands |
 | `BRIDGE_PORT` | `3210` | Service and owner commands |
-| `WHATSAPP_HISTORY_MODE` | `desktop` for new pairings; saved profile for existing pairings | Service |
+| `WHATSAPP_HISTORY_MODE` | `full` for new pairings; saved preference for existing pairings | Service |
 | `WHATSAPP_BRIDGE_TOKEN` | Required | Stdio adapter |
 | `WHATSAPP_BRIDGE_URL` | `http://127.0.0.1:3210/mcp` | Stdio adapter |
 

@@ -52,8 +52,9 @@ at the deadline. Retrieved messages are shared across local clients through SQLi
 Coverage lives in local read results; network fetching is a separate explicit action.
 The owner history endpoint uses the same queue and job format as MCP.
 
-New pairings request desktop/full history. Existing pairings preserve their device
-profile, saved across restarts, because changing it can prevent reconnection.
+New pairings request full history using the default Chrome profile. Existing
+pairings preserve their saved sync preference. Both sync modes keep the same
+browser identity; WhatsApp controls how much history it shares.
 
 ## Access and approval
 

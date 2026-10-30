@@ -9,11 +9,9 @@ export function resolveHistoryMode(options: {
   paired: boolean;
 }) {
   return z
-    .enum(["desktop", "recent"])
+    .enum(["full", "recent"])
     .parse(
-      options.override ??
-        options.saved ??
-        (options.paired ? "recent" : "desktop"),
+      options.override ?? options.saved ?? (options.paired ? "recent" : "full"),
     );
 }
 
@@ -300,7 +298,9 @@ export class HistorySync {
         const currentAnchor = anchor;
         const candidates = [...(result.batch?.ids ?? [])]
           .flatMap((id) => {
-            const message = this.store.findMessage(id);
+            const message = this.store.historyAnchor(job.chat_id, {
+              messageId: id,
+            });
             return message &&
               !message.deleted &&
               message.sentAt &&

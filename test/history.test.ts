@@ -451,21 +451,15 @@ test("MCP reads/searches stay local, coverage is included, explicit sync reports
   }
 });
 
-test("broader initial sync preserves existing linked-device profiles", () => {
-  assert.equal(
-    resolveHistoryMode({ saved: undefined, paired: false }),
-    "desktop",
-  );
+test("full initial sync preserves existing sync preferences", () => {
+  assert.equal(resolveHistoryMode({ saved: undefined, paired: false }), "full");
   assert.equal(
     resolveHistoryMode({ saved: undefined, paired: true }),
     "recent",
   );
+  assert.equal(resolveHistoryMode({ saved: "full", paired: true }), "full");
   assert.equal(
-    resolveHistoryMode({ saved: "desktop", paired: true }),
-    "desktop",
-  );
-  assert.equal(
-    resolveHistoryMode({ override: "recent", saved: "desktop", paired: true }),
+    resolveHistoryMode({ override: "recent", saved: "full", paired: true }),
     "recent",
   );
   assert.throws(() =>
@@ -539,6 +533,48 @@ test("same-second response messages advance by their actual key without requirin
     );
     assert.equal(job.state, "batch_limit");
     assert.equal(job.next_message_id, earlier.id);
+  } finally {
+    sync.close();
+    f.close();
+  }
+});
+
+test("metadata-only history rows cannot become pagination anchors", async () => {
+  const f = fixture();
+  const ghost = f.ingest("2026-09-01T00:00:00Z", "metadata");
+  f.store.put("raw", ghost.id, {
+    key: { id: "metadata", remoteJid: f.chat.jid, fromMe: false },
+    messageTimestamp: Date.parse("2026-09-01T00:00:00Z") / 1000,
+    message: { messageContextInfo: {} },
+  });
+  const anchor = f.ingest("2026-10-01T00:00:00Z");
+  assert.equal(f.store.historyAnchor(f.chat.id)?.id, anchor.id);
+  assert.equal(f.store.historyAnchor(f.chat.id, { messageId: ghost.id }), null);
+  let sync!: HistorySync;
+  let calls = 0;
+  sync = new HistorySync(
+    f.store,
+    {
+      connected: () => true,
+      request: async (_chat, _count, id) => {
+        assert.equal(id, anchor.id);
+        calls++;
+        sync.received({
+          requestId: "metadata-page",
+          progress: 100,
+          messages: [ghost],
+        });
+        return { requestId: "metadata-page" };
+      },
+    },
+    100,
+  );
+  try {
+    const result = await terminal(sync, sync.start({ chat_id: f.chat.id }).id);
+    assert.equal(result.state, "no_progress");
+    assert.equal(result.next_message_id, anchor.id);
+    assert.equal(result.traversed_from, null);
+    assert.equal(calls, 1);
   } finally {
     sync.close();
     f.close();
