@@ -21,45 +21,6 @@ import { z } from "zod";
 import { Store, opaque } from "./store.js";
 import { BridgeError, messageSchema, type Draft } from "./domain.js";
 import type { Sender } from "./service.js";
-const keyPair = z.object({
-  public: z.instanceof(Uint8Array),
-  private: z.instanceof(Uint8Array),
-});
-const keySchemas = {
-  "lid-mapping": z.string(),
-  "device-list": z.array(z.string()),
-  tctoken: z.object({
-    token: z.instanceof(Buffer),
-    timestamp: z.string().optional(),
-    senderTimestamp: z.number().optional(),
-  }),
-  "identity-key": z.instanceof(Uint8Array),
-  "pre-key": keyPair,
-  session: z.instanceof(Uint8Array),
-  "sender-key": z.instanceof(Uint8Array),
-  "sender-key-memory": z.record(z.boolean()),
-  "app-state-sync-key": z.object({
-    keyData: z.instanceof(Uint8Array).nullish(),
-    fingerprint: z
-      .object({
-        rawId: z.number().nullish(),
-        currentIndex: z.number().nullish(),
-        deviceIndexes: z.array(z.number()).nullish(),
-      })
-      .nullish(),
-    timestamp: z
-      .union([
-        z.number(),
-        z.object({ low: z.number(), high: z.number(), unsigned: z.boolean() }),
-      ])
-      .nullish(),
-  }),
-  "app-state-sync-version": z.object({
-    version: z.number(),
-    hash: z.instanceof(Buffer),
-    indexValueMap: z.record(z.object({ valueMac: z.instanceof(Uint8Array) })),
-  }),
-};
 function toMessage(value: unknown): WAMessage {
   const message = proto.WebMessageInfo.fromObject(
     z.record(z.unknown()).parse(value),
@@ -112,13 +73,14 @@ export class WhatsApp implements Sender {
           for (const id of ids) {
             const value = this.store.get("key", `${type}:${id}`);
             if (value) {
-              const parsed = keySchemas[type].parse(value);
+              // Baileys owns these formats. In rc14, Signal sessions are objects
+              // even though SignalDataTypeMap declares Uint8Array.
               result[id] = (
                 type === "app-state-sync-key"
                   ? proto.Message.AppStateSyncKeyData.fromObject(
-                      keySchemas["app-state-sync-key"].parse(value),
+                      z.record(z.unknown()).parse(value),
                     )
-                  : parsed
+                  : value
               ) as SignalDataTypeMap[typeof type];
             }
           }
