@@ -888,6 +888,69 @@ test("encrypted edits authenticate, update the original, and preserve the secret
   }
 });
 
+test("stdio reads do not wait behind an in-flight send", async () => {
+  const f = fixture();
+  f.store.put("client", f.p.id, { ...f.p, canSend: true });
+  let release = () => {};
+  let started = () => {};
+  const sending = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.sender.send = async () => {
+    started();
+    await held;
+    return "held-send";
+  };
+  const port = 33223;
+  const http = createApp(
+    f.service,
+    new WhatsApp(f.store),
+    "owner-key",
+    port,
+  ).listen(port, "127.0.0.1");
+  await new Promise<void>((resolve) => http.once("listening", resolve));
+  const proxy = createStdioProxy(`http://127.0.0.1:${port}/mcp`, "agent-key");
+  const client = new Client({ name: "concurrent-read", version: "1" });
+  const [local, remote] = InMemoryTransport.createLinkedPair();
+  try {
+    await proxy.connect(remote);
+    await client.connect(local);
+    const draft = f.service.createDraft(f.p, {
+      chat_id: f.a.id,
+      text: "held",
+      request_id: "held",
+    });
+    const send = client.callTool({
+      name: "send_draft",
+      arguments: {
+        draft_id: draft.id,
+        digest: draft.digest,
+        chat_name: "Client A",
+        text: "held",
+      },
+    });
+    await sending;
+    const read = await client.callTool(
+      { name: "get_status", arguments: {} },
+      undefined,
+      { timeout: 2_000 },
+    );
+    assert.equal(read.isError, undefined);
+    release();
+    assert.equal((await send).isError, undefined);
+  } finally {
+    release();
+    await client.close();
+    await proxy.close();
+    http.closeAllConnections();
+    await new Promise<void>((resolve) => http.close(() => resolve()));
+    f.close();
+  }
+});
+
 test("HTTP and stdio clients send without elicitation and do not resend accepted drafts", async () => {
   const f = fixture();
   f.store.put("client", f.p.id, { ...f.p, canSend: true });

@@ -43,6 +43,28 @@ export class Store {
     CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,chat TEXT NOT NULL,observed TEXT NOT NULL,sent TEXT,value TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS messages_chat ON messages(chat,observed,id);
     CREATE TABLE IF NOT EXISTS requests(client TEXT,request TEXT,digest TEXT,draft TEXT,PRIMARY KEY(client,request));`);
+    if (
+      !this.db
+        .prepare("PRAGMA table_info(messages)")
+        .all()
+        .some((c) => c.name === "rev")
+    )
+      this.db.exec(
+        "ALTER TABLE messages ADD COLUMN rev INTEGER NOT NULL DEFAULT 0",
+      );
+    this.db
+      .exec(`CREATE TABLE IF NOT EXISTS message_revision_counter(id INTEGER PRIMARY KEY CHECK(id=1),value INTEGER NOT NULL);
+      INSERT OR IGNORE INTO message_revision_counter VALUES(1,0);
+      CREATE INDEX IF NOT EXISTS messages_chat_rev ON messages(chat,rev);
+      CREATE TRIGGER IF NOT EXISTS message_revision_insert AFTER INSERT ON messages BEGIN
+        UPDATE message_revision_counter SET value=value+1 WHERE id=1;
+        UPDATE messages SET rev=(SELECT value FROM message_revision_counter WHERE id=1) WHERE id=new.id;
+      END;
+      CREATE TRIGGER IF NOT EXISTS message_revision_update AFTER UPDATE OF value ON messages BEGIN
+        UPDATE message_revision_counter SET value=value+1 WHERE id=1;
+        UPDATE messages SET rev=(SELECT value FROM message_revision_counter WHERE id=1) WHERE id=new.id;
+      END;`);
+    this.db.exec("UPDATE messages SET value=value WHERE rev=0");
     try {
       this.attachments = new MediaStore(this.db, dir);
     } catch (error) {
@@ -677,7 +699,7 @@ export class Store {
   private writeMessage(message: Message) {
     this.db
       .prepare(
-        "INSERT INTO messages VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat=excluded.chat,value=excluded.value,sent=excluded.sent,observed=excluded.observed",
+        "INSERT INTO messages(id,chat,observed,sent,value) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET chat=excluded.chat,value=excluded.value,sent=excluded.sent,observed=excluded.observed",
       )
       .run(
         message.id,

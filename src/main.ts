@@ -6,6 +6,7 @@ import { Store } from "./store.js";
 import { WhatsApp } from "./whatsapp.js";
 import { Service } from "./service.js";
 import { createApp } from "./server.js";
+import { ReplyWatches } from "./replies.js";
 process.umask(0o077);
 const dir = resolve(process.env.BRIDGE_DATA_DIR || ".data");
 mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -36,15 +37,22 @@ const wa = new WhatsApp(store);
 wa.repairHistoricalSenders();
 wa.restoreReactions();
 wa.replayEncryptedEdits();
-const service = new Service(store, wa);
+const replySettingsPath = join(dir, "reply-settings.json");
+const replies = new ReplyWatches(
+  store,
+  existsSync(replySettingsPath)
+    ? JSON.parse(readFileSync(replySettingsPath, "utf8"))
+    : {},
+);
+replies.start();
+const service = new Service(store, wa, replies);
 const app = createApp(service, wa, readFileSync(keyPath, "utf8").trim(), port);
 const server = app.listen(port, "127.0.0.1", () => {
-  process.stderr.write(
-    `WhatsApp MCP listening at http://127.0.0.1:${port}.\n`,
-  );
+  process.stderr.write(`WhatsApp MCP listening at http://127.0.0.1:${port}.\n`);
   wa.start();
 });
 server.on("error", async () => {
+  await replies.close();
   wa.stop();
   store.close();
   await release();
@@ -55,6 +63,7 @@ async function stop() {
   if (closing) return;
   closing = true;
   clearInterval(maintenance);
+  await replies.close();
   wa.stop();
   server.close();
   server.closeAllConnections();

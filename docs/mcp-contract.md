@@ -80,6 +80,31 @@ never automatically replays `sync_history`, while local reads remain safe to ret
 After sync, issue a fresh local query to include new messages. Existing page
 cursors retain their original observation watermark.
 
+## Reply subscriptions
+
+`watch_replies({request_id, draft_ids | message_ids, waiting_for,
+timeout_seconds?, from_participant_ids?, notify?})` creates an idempotent subscription
+to one chat. `timeout_seconds` is 1–604800, default 1800. Choose one anchor kind;
+each accepts up to ten outgoing messages or owned drafts. Draft subscriptions
+activate when the approved send starts. Existing-message subscriptions evaluate
+stored conversation after those messages. `notify` is `{bag, peer, service?,
+service_token}` and requires a recipient-owned Postbag service grant; it is omitted
+from public responses except for routing names. No notification destination means
+pull-only. All incoming participants are eligible unless explicitly narrowed.
+
+`get_replies({watch_id, after?, ack_through?, include_unrelated?, limit?})` returns
+the latest decision per message, current message content, status, notices and a
+`next_cursor`. `after` paginates decision events. Acknowledgement requires a cursor
+already issued to this subscription; reads alone do not advance the durable receipt
+cursor. Deleted content is erased and returned only as a tombstone/reference.
+Labels include relevant, possible, unclassified and, for audit or corrections,
+unrelated. `cancel_watch({watch_id})` terminates classification and records a
+terminal event. All operations recheck the owning principal.
+
+`get_status.reply_subscriptions` reports this key's recent IDs, deadlines, states
+and the configured classifier. See [Reply subscriptions](replies.md) for lifecycle,
+CLI isolation, batching, budgets, model-error behavior and delivery limitations.
+
 ## Drafts and sends
 
 `create_draft` accepts `chat_id`, `text`, an optional `reply_to_message_id`,
