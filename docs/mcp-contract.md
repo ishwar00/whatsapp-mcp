@@ -85,18 +85,17 @@ cursors retain their original observation watermark.
 `watch_replies({request_id, draft_ids | message_ids, waiting_for,
 timeout_seconds?, from_participant_ids?, notify?})` creates an idempotent subscription
 to one chat. `timeout_seconds` is 1–604800, default 1800. Choose one anchor kind;
-each accepts up to ten outgoing messages or owned drafts. Draft subscriptions
-activate when the approved send starts. Existing-message subscriptions evaluate
-stored conversation after those messages. `notify` is `{bag, peer, service?,
+each accepts up to ten outgoing messages or owned accepted drafts. Subscribe after
+sending; already-stored responses are included. The deadline is the earliest
+watched send time plus the timeout, so late registration does not extend it. `notify` is `{bag, peer, service?,
 service_token}` and requires a recipient-owned Postbag service grant; it is omitted
 from public responses except for routing names. No notification destination means
 pull-only. All incoming participants are eligible unless explicitly narrowed.
 
-`get_replies({watch_id, after?, ack_through?, include_unrelated?, limit?})` returns
+`get_replies({watch_id, after?, include_unrelated?, limit?})` returns
 the latest decision per message, current message content, status, notices and a
-`next_cursor`. `after` paginates decision events. Acknowledgement requires a cursor
-already issued to this subscription; reads alone do not advance the durable receipt
-cursor. Deleted content is erased and returned only as a tombstone/reference.
+`next_cursor`. `after` paginates decision events; reads are repeatable and there is
+no acknowledgment step. Pointer notices can be retried with the same ID/revision. Deleted content is erased and returned only as a tombstone/reference.
 Labels include relevant, possible, unclassified and, for audit or corrections,
 unrelated. `cancel_watch({watch_id})` terminates classification and records a
 terminal event. All operations recheck the owning principal.

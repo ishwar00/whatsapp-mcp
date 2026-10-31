@@ -73,7 +73,9 @@ than taking another session's name. The grant returns a token scoped to that bag
 recipient and service. Keep it private and provide it in `watch_replies.notify`.
 Registering another grant rotates the token; `--ttl 0` revokes it. A recipient
 rejoin invalidates its earlier grants. Renew the grant from the receiving session
-when needed. The default grant lifetime is one hour, capped at seven days.
+when needed. Credentials are stored once per agent key and notification destination;
+renewing a grant through any one watch updates all sibling watches using it.
+The default grant lifetime is one hour, capped at seven days.
 The watch result warns if the grant can end before its deadline. Renew by calling
 `watch_replies` with the same request ID and scope plus the fresh token; definite
 failed deliveries then become pending again. Use the executable reported in
@@ -93,16 +95,18 @@ inserted into a user-role notification. The agent retrieves actual content throu
 
 ## Subscribe and read
 
-1. Create the outgoing draft or drafts.
-2. Call `watch_replies` with those `draft_ids`, a `waiting_for` description,
-   `timeout_seconds`, a unique `request_id`, and optional `notify` credentials.
-3. Send through the existing human-approved `send_draft` workflow. The subscription
-   activates at the send attempt. A prepared subscription also expires if no send
-   begins within its timeout. Watches can instead target existing outgoing
-   `message_ids`; their stored subsequent conversation can be evaluated too.
-4. On a notice, call `get_replies({watch_id})`. Save `next_cursor`. After receiving
-   the result, acknowledge it with `ack_through: next_cursor`; pass `after` to page
-   through later events. Acknowledgement confirms receipt, not completion of work.
+1. Create and send the outgoing draft or drafts through the existing human-approved
+   `send_draft` workflow.
+2. Call `watch_replies` with accepted `draft_ids` or outgoing `message_ids`, a
+   `waiting_for` description, `timeout_seconds`, a unique `request_id`, and optional
+   `notify` credentials. Pending drafts are rejected.
+3. The service includes replies already stored after the send, so an immediate
+   response arriving before subscription creation is still found. The deadline is
+   the earliest watched send time plus the timeout; registering late cannot extend
+   it. A watch registered after its deadline reports expiry.
+4. On a notice, call `get_replies({watch_id})`. Save `next_cursor` and pass it as
+   `after` for later reads. There is no separate acknowledgment call. Notices carry
+   stable IDs and revisions; duplicate pointers are safe to ignore.
 5. Use `cancel_watch` when the replies are sufficient. Otherwise the subscription
    continues until its absolute deadline.
 
@@ -125,7 +129,8 @@ batches rather than the entire conversation repeatedly. The packet contains:
 
 Older supporting context is removed first when the context budget is reached;
 the omission count is included. Original messages are never silently truncated.
-Oversized candidate packets surface as unclassified rather than disappearing.
+Batches are packed to the context limit. An individually oversized message is
+retained as unclassified while fitting neighboring messages are still classified.
 Quoted replies to selected messages bypass semantic classification.
 
 Labels are `relevant`, `unrelated` or `uncertain`. The service reconsiders uncertain
@@ -146,7 +151,7 @@ task completion nor authorization.
 does not extend it. At the deadline, classification is aborted, late results are
 discarded, and undecided in-window messages are retained as unclassified. A single
 terminal notice reports `expired_no_reply`, `expired_with_replies`,
-`expired_unclassified`, or `expired_before_send`. Cancellation also persists a
+`expired_unclassified`. Cancellation also persists a
 terminal notice.
 
 Message revisions, decisions and notices survive restarts. Decisions are keyed by
@@ -155,17 +160,23 @@ old content into new replies. Existing messages are assigned revisions when the
 feature is first opened. Sender timestamps have second precision; subscriptions
 include the starting second to avoid losing immediate replies.
 
-Postbag submission does not prove agent processing. Known-unavailable destinations
-retry with bounded exponential backoff for up to seven days. Unknown submissions
-are retained for reconciliation and are not blindly retried. In-progress delivery
-at service shutdown becomes unknown on restart. Agents can always recover through
-`get_replies`. Terminal subscription data is retained for seven days after its
-deadline; active subscriptions are capped at ten per key, stored subscriptions
-at 1000 per key.
-Revoked or invalid grants fail without repeated retries. The notices returned by
-`get_replies` expose submitted, unavailable, failed, unknown and acknowledged
-outcomes. Sender timestamps and the local clock can differ; including the starting
-second handles timestamp precision but cannot eliminate larger clock skew.
+Decisions, cursor advancement and notice creation commit in one SQLite transaction.
+A crash cannot leave a new decision without its corresponding notice.
+
+Postbag submission does not prove agent processing. Pointer notices use bounded
+exponential retries, including uncertain submissions and interrupted sends, for up
+to seven days and at most 256 attempts. Retries reuse the notice ID and revision;
+a duplicate notice is possible. Successful submission stops retries. Permanent
+refusals fail immediately; renewing the destination grant requeues failed notices
+for every watch sharing that destination. Reads are repeatable and never consume
+or authorize anything.
+
+`get_replies` exposes notice states `pending`, `sending`, `sent`, and `failed`.
+`sent` means submitted to Postbag, not confirmed as processed by the agent. Terminal
+subscription data is retained for seven days after its deadline; active watches
+are capped at ten per key, stored watches at 1000 per key. Sender timestamps and
+the local clock can differ; including the starting second handles timestamp
+precision but cannot eliminate larger clock skew.
 
 The service cannot recover messages WhatsApp never delivered. A subscription
 deadline with no classified reply is not proof that nobody responded on WhatsApp.

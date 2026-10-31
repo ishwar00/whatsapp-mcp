@@ -145,6 +145,7 @@ test("Postbag receipts distinguish permanent refusals, transient failures and un
     watch_id: "watch-fixture",
     notice_id: 1,
     kind: "reply_candidates",
+    upto: 7,
   };
   try {
     for (const [receipt, expected] of [

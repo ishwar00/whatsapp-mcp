@@ -41,25 +41,25 @@ function fixture(
       return "submitted" as const;
     },
   };
+  const runClassify = async (
+    c: ReplyContext,
+    s: AbortSignal,
+  ): Promise<Classification> => {
+    contexts.push(c);
+    if (classify) return classify(c, s);
+    return {
+      results: c.candidates.map((m) => ({
+        message_id: m.id,
+        revision: m.revision,
+        label: /record|done/.test(m.text) ? "relevant" : "unrelated",
+        reason: "Synthetic test classification",
+      })),
+    };
+  };
   let replies = new ReplyWatches(
     store,
     { quiet_seconds: 0, ...settings },
-    {
-      now: () => now,
-      notifier,
-      classify: async (c, s) => {
-        contexts.push(c);
-        if (classify) return classify(c, s);
-        return {
-          results: c.candidates.map((m) => ({
-            message_id: m.id,
-            revision: m.revision,
-            label: /record|done/.test(m.text) ? "relevant" : "unrelated",
-            reason: "Synthetic test classification",
-          })),
-        };
-      },
-    },
+    { now: () => now, notifier, classify: runClassify },
   );
   const ingest = (
     text: string,
@@ -131,8 +131,8 @@ function fixture(
       await replies.close();
       replies = new ReplyWatches(
         store,
-        { quiet_seconds: 0 },
-        { now: () => now, notifier, classify },
+        { quiet_seconds: 0, ...settings },
+        { now: () => now, notifier, classify: runClassify },
       );
     },
     async close() {
@@ -144,7 +144,7 @@ function fixture(
   };
 }
 
-test("every incoming group bubble is classified; only relevant messages produce pointer notices and reads are acknowledged explicitly", async () => {
+test("every incoming group bubble is classified; only relevant messages produce pointer notices without a receipt-acknowledgment protocol", async () => {
   const f = fixture();
   try {
     const w = await f.create();
@@ -172,16 +172,7 @@ test("every incoming group bubble is classified; only relevant messages produce 
     assert.equal(read.unrelated_count, 2);
     assert.equal(f.notices.length, 1);
     assert.equal(JSON.stringify(f.notices).includes("record"), false);
-    assert.equal(read.watch.notices[0]?.state, "submitted");
-    const acked = f.replies.read(f.p, {
-      watch_id: w.id,
-      ack_through: read.next_cursor,
-    });
-    assert.equal(acked.watch.notices[0]?.state, "acknowledged");
-    assert.throws(
-      () => f.replies.read(f.p, { watch_id: w.id, ack_through: 999999 }),
-      /acknowledge/,
-    );
+    assert.equal(read.watch.notices[0]?.state, "sent");
     f.advance();
     f.ingest("done, both records are there");
     await f.replies.tick();
@@ -224,7 +215,6 @@ test("quoted replies skip the classifier, duplicates don't notify, and edits/del
     await f.replies.tick();
     assert.equal(f.notices.length, 1);
     const firstRead = f.replies.read(f.p, { watch_id: w.id });
-    f.replies.read(f.p, { watch_id: w.id, ack_through: firstRead.next_cursor });
     f.store.saveMessage({
       ...f.store.message(quote.id),
       text: "actually no",
@@ -324,31 +314,38 @@ test("hard deadline aborts in-flight classification, unrelated chatter cannot ex
   }
 });
 
-test("prepared draft watches capture a reply before send returns; timeout starts at approved send attempt", async () => {
+test("subscribe after accepted send catches an immediate reply without prepared state", async () => {
   const f = fixture();
   try {
-    const sender = {
-      connected: true,
-      ownerIds: [],
-      send: async () => {
-        f.ingest("done with both records");
-        return "provider-out";
+    const service = new Service(
+      f.store,
+      {
+        connected: true,
+        ownerIds: [],
+        send: async () => {
+          f.ingest("done with both records");
+          return "provider-out";
+        },
       },
-    };
-    const service = new Service(f.store, sender, f.replies);
+      f.replies,
+    );
     const d = service.createDraft(f.p, {
       chat_id: f.chat.id,
-      text: "add the records",
+      text: "add records",
       request_id: "draft",
     });
-    const w = await f.create({ message_ids: undefined, draft_ids: [d.id] });
-    assert.equal(w.state, "prepared");
-    f.advance(10000);
+    await assert.rejects(
+      f.create({ message_ids: undefined, draft_ids: [d.id] }),
+      /after the draft/,
+    );
     await service.sendDraft(f.p, d.id, d.digest, f.chat.name, d.input.text, []);
+    const attemptedAt = f.store.draft(d.id).attemptedAt!;
+    f.advance(1000);
+    const w = await f.create({ message_ids: undefined, draft_ids: [d.id] });
+    assert.equal(w.state, "active");
+    assert.equal(Date.parse(w.expires_at), Date.parse(attemptedAt) + 30000);
     await f.replies.tick();
-    const read = f.replies.read(f.p, { watch_id: w.id });
-    assert.equal(read.replies.length, 1);
-    assert.equal(Date.parse(read.watch.expires_at), f.now() + 30000);
+    assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 1);
   } finally {
     await f.close();
   }
@@ -403,7 +400,6 @@ test("a reconsidered uncertain reply gets a new event beyond an already-read cur
     await f.replies.tick();
     const first = f.replies.read(f.p, { watch_id: w.id });
     assert.equal(first.replies.length, 1);
-    f.replies.read(f.p, { watch_id: w.id, ack_through: first.next_cursor });
     await f.replies.tick();
     const second = f.replies.read(f.p, {
       watch_id: w.id,
@@ -474,53 +470,45 @@ test("budget exhaustion sends one warning instead of notifying for every unrelat
   }
 });
 
-test("same-second fast replies survive millisecond send arming and prepared watches never resurrect after expiry", async () => {
+test("same-second replies survive millisecond send time and a late subscription cannot extend its deadline", async () => {
   const f = fixture();
   try {
-    const service = new Service(
-      f.store,
-      {
-        connected: true,
-        ownerIds: [],
-        send: async () => {
-          f.ingest("done with records", {
-            at: Math.floor(f.now() / 1000) * 1000,
-          });
-          return "sent";
-        },
-      },
-      f.replies,
-    );
-    const d = service.createDraft(f.p, {
+    const d = new Service(f.store, {
+      connected: true,
+      ownerIds: [],
+      send: async () => "sent",
+    }).createDraft(f.p, {
       chat_id: f.chat.id,
       text: "records",
       request_id: "fast",
     });
+    const sentAt = f.now() + 700;
+    f.store.saveDraft({
+      ...d,
+      status: "accepted",
+      providerId: "sent",
+      attemptedAt: new Date(sentAt).toISOString(),
+    });
+    f.advance(700);
+    f.ingest("done with records", { at: Math.floor(f.now() / 1000) * 1000 });
     const w = await f.create({
       message_ids: undefined,
       draft_ids: [d.id],
       timeout_seconds: 5,
     });
-    f.advance(700);
-    await service.sendDraft(f.p, d.id, d.digest, f.chat.name, d.input.text, []);
     await f.replies.tick();
     assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 1);
-    const d2 = service.createDraft(f.p, {
-      chat_id: f.chat.id,
-      text: "records",
-      request_id: "late",
-    });
+    f.advance(6000);
     const late = await f.create({
       message_ids: undefined,
-      draft_ids: [d2.id],
-      timeout_seconds: 1,
+      draft_ids: [d.id],
+      timeout_seconds: 5,
     });
-    f.advance(1001);
-    f.replies.armDraft(d2.id);
     assert.equal(
       f.replies.read(f.p, { watch_id: late.id }).watch.state,
       "expired",
     );
+    assert.equal(Date.parse(late.expires_at), sentAt + 5000);
   } finally {
     await f.close();
   }
@@ -574,6 +562,201 @@ test("legacy revision bootstrap prevents skipping more than one page of existing
   } finally {
     await replies?.close();
     reopened?.close();
+    await f.close();
+  }
+});
+
+test("a failed notice transaction rolls back decisions and cursor, then restart recovers one reply notice", async () => {
+  const f = fixture();
+  try {
+    const w = await f.create();
+    f.advance();
+    f.ingest("done with records");
+    const before = f.replies.read(f.p, { watch_id: w.id }).watch.cursor_rev;
+    f.store.db.exec(
+      "CREATE TRIGGER fail_notice BEFORE INSERT ON reply_notices BEGIN SELECT RAISE(ABORT,'simulated failure before notice commit'); END;",
+    );
+    await f.replies.tick();
+    assert.equal(
+      f.store.db.prepare("SELECT count(*) n FROM reply_decisions").get()?.n,
+      0,
+    );
+    assert.equal(
+      f.replies.read(f.p, { watch_id: w.id }).watch.cursor_rev,
+      before,
+    );
+    f.store.db.exec("DROP TRIGGER fail_notice");
+    await f.restart();
+    await f.replies.tick();
+    await f.replies.tick();
+    const result = f.replies.read(f.p, { watch_id: w.id });
+    assert.equal(result.replies.length, 1);
+    assert.equal(result.watch.notices.length, 1);
+    assert.equal(result.watch.notices[0]?.state, "sent");
+    assert.equal(f.notices.length, 1);
+    await f.restart();
+    await f.replies.tick();
+    assert.equal(f.notices.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("oversized candidates are isolated and fitting batches never skip their neighbors", async () => {
+  const f = fixture(undefined, { max_context_characters: 4000 });
+  try {
+    const w = await f.create();
+    f.advance();
+    const long = f.ingest("unrelated " + "x".repeat(6000));
+    const short = f.ingest("both records added");
+    for (let i = 0; i < 12; i++)
+      f.ingest("record " + i + " " + "x".repeat(1100));
+    for (let i = 0; i < 16; i++) await f.replies.tick();
+    const r = f.replies.read(f.p, { watch_id: w.id });
+    assert.equal(
+      r.replies.find((x) => x.message?.id === long.id)?.label,
+      "unclassified",
+    );
+    assert.equal(
+      r.replies.find((x) => x.message?.id === short.id)?.label,
+      "relevant",
+    );
+    assert.equal(r.replies.filter((x) => x.label === "relevant").length, 13);
+    assert.ok(f.contexts.length > 1);
+    for (const c of f.contexts) {
+      assert.ok(JSON.stringify(c).length <= 4000);
+      assert.ok(!c.candidates.some((x) => x.id === long.id));
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("rotating a shared destination renews sibling watches and their failed deliveries without copying tokens into watches", async () => {
+  const f = fixture();
+  let replies: ReplyWatches | undefined;
+  try {
+    let token = "synthetic-original-token-value";
+    const r = (replies = new ReplyWatches(
+      f.store,
+      { quiet_seconds: 0 },
+      {
+        now: f.now,
+        notifier: {
+          check: async () => ({
+            expires_at: new Date(f.now() + 3600000).toISOString(),
+          }),
+          send: async (d) =>
+            d.service_token === token ? "submitted" : "failed",
+        },
+        classify: async (c) => ({
+          results: c.candidates.map((m) => ({
+            message_id: m.id,
+            revision: m.revision,
+            label: "relevant",
+            reason: "fixture",
+          })),
+        }),
+      },
+    ));
+    const scope = (request_id: string) => ({
+      request_id,
+      message_ids: [f.original.id],
+      waiting_for: "records",
+      notify: { bag: "test", peer: "agent", service_token: token },
+    });
+    const a = await r.create(f.p, scope("a")),
+      b = await r.create(f.p, scope("b"));
+    token = "synthetic-rotated-token-value";
+    f.advance();
+    f.ingest("records added");
+    await r.tick();
+    await r.tick();
+    await r.tick();
+    assert.equal(
+      r.read(f.p, { watch_id: a.id }).watch.notices[0]?.state,
+      "failed",
+    );
+    await r.create(f.p, scope("b"));
+    await r.tick();
+    for (const id of [a.id, b.id])
+      assert.equal(
+        r.read(f.p, { watch_id: id }).watch.notices[0]?.state,
+        "sent",
+      );
+    assert.equal(f.store.all("reply-destination").length, 1);
+    assert.equal(
+      JSON.stringify(f.store.all("reply-watch")).includes("service_token"),
+      false,
+    );
+    f.store.eraseMessage(f.original.id);
+    await r.create(f.p, scope("b")); // Renewal does not depend on retaining original content.
+  } finally {
+    await replies?.close();
+    await f.close();
+  }
+});
+
+test("unknown pointer submissions retry the same notice identity without an acknowledgment call", async () => {
+  const f = fixture();
+  let replies: ReplyWatches | undefined;
+  try {
+    const attempts: { id: number; upto: number }[] = [];
+    const r = (replies = new ReplyWatches(
+      f.store,
+      { quiet_seconds: 0 },
+      {
+        now: f.now,
+        notifier: {
+          check: async () => {},
+          send: async (_d, n) => {
+            attempts.push({ id: n.notice_id, upto: n.upto });
+            return attempts.length === 1 ? "unknown" : "submitted";
+          },
+        },
+        classify: async (c) => ({
+          results: c.candidates.map((m) => ({
+            message_id: m.id,
+            revision: m.revision,
+            label: "relevant",
+            reason: "fixture",
+          })),
+        }),
+      },
+    ));
+    const w = await r.create(f.p, {
+      request_id: "retry",
+      message_ids: [f.original.id],
+      waiting_for: "records",
+      notify: {
+        bag: "test",
+        peer: "agent",
+        service_token: "synthetic-service-token-value",
+      },
+    });
+    f.advance();
+    f.ingest("done");
+    await r.tick();
+    await r.tick();
+    assert.equal(
+      r.read(f.p, { watch_id: w.id }).watch.notices[0]?.state,
+      "pending",
+    );
+    f.advance(5001);
+    await r.tick();
+    assert.equal(
+      r.read(f.p, { watch_id: w.id }).watch.notices[0]?.state,
+      "sent",
+    );
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts[0], attempts[1]);
+    const first = r.read(f.p, { watch_id: w.id });
+    assert.equal(
+      r.read(f.p, { watch_id: w.id, after: first.next_cursor }).replies.length,
+      0,
+    );
+  } finally {
+    await replies?.close();
     await f.close();
   }
 });

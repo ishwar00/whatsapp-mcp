@@ -48,21 +48,24 @@ export const watchInput = z
     notify: replyDestinationSchema.optional(),
   })
   .strict();
-const watchSchema = watchInput.extend({
+const destinationSchema = replyDestinationSchema.extend({
+  id: z.string(),
+  client_id: z.string(),
+  expires_at: z.string().nullable(),
+});
+const watchSchema = watchInput.omit({ notify: true }).extend({
+  destination_id: z.string().nullable(),
   id: z.string(),
   client_id: z.string(),
   chat_id: z.string(),
-  state: z.enum(["prepared", "active", "expired", "cancelled"]),
+  state: z.enum(["active", "expired", "cancelled"]),
   created_at: z.string(),
   started_at: z.string(),
   expires_at: z.string(),
   cursor_rev: z.number(),
-  acked_cursor: z.number(),
-  issued_cursor: z.number(),
   calls_used: z.number(),
   pending_since: z.number().nullable(),
   error: z.string().nullable(),
-  notify_expires_at: z.string().nullable().default(null),
   fingerprint: z.string(),
 });
 type Watch = z.infer<typeof watchSchema>;
@@ -89,17 +92,7 @@ const noticeSchema = z.object({
   watch: z.string(),
   kind: z.string(),
   upto: z.number(),
-  state: z.enum([
-    "pending",
-    "attempting",
-    "submitted",
-    "unknown",
-    "unavailable",
-    "acknowledged",
-    "superseded",
-    "exhausted",
-    "failed",
-  ]),
+  state: z.enum(["pending", "sending", "sent", "failed"]),
   attempts: z.number(),
   next_at: z.number(),
 });
@@ -164,7 +157,62 @@ export class ReplyWatches {
       WHEN json_extract(new.value,'$.deleted')=1 BEGIN
         UPDATE reply_decisions SET reason='Message deleted' WHERE message_id=new.id;
       END;
-      UPDATE reply_notices SET state='unknown' WHERE state='attempting';`);
+      UPDATE reply_notices SET state='pending' WHERE state IN ('attempting','sending','unknown','unavailable');
+      UPDATE reply_notices SET state='sent' WHERE state IN ('submitted','acknowledged');
+      UPDATE reply_notices SET state='failed' WHERE state IN ('superseded','exhausted');`);
+    this.upgradeWatches();
+  }
+  private upgradeWatches() {
+    for (const raw of this.store.all("reply-watch")) {
+      const old = z
+        .object({
+          id: z.string(),
+          client_id: z.string(),
+          state: z.string(),
+          notify: replyDestinationSchema.optional(),
+          notify_expires_at: z.string().nullable().optional(),
+        })
+        .passthrough()
+        .parse(raw);
+      if ("destination_id" in old) continue;
+      const {
+        notify,
+        notify_expires_at,
+        acked_cursor,
+        issued_cursor,
+        ...rest
+      } = old;
+      const destination = notify
+        ? this.destinationId(old.client_id, notify)
+        : null;
+      if (notify)
+        this.store.put("reply-destination", destination!, {
+          ...notify,
+          id: destination,
+          client_id: old.client_id,
+          expires_at: notify_expires_at ?? null,
+        });
+      this.save(
+        watchSchema.parse({
+          ...rest,
+          destination_id: destination,
+          state: old.state === "prepared" ? "cancelled" : old.state,
+        }),
+      );
+    }
+  }
+  private destinationId(
+    client: string,
+    notify: z.infer<typeof replyDestinationSchema>,
+  ) {
+    return hash([client, notify.bag, notify.peer, notify.service]);
+  }
+  private destination(watch: Watch) {
+    return watch.destination_id
+      ? destinationSchema.parse(
+          this.store.get("reply-destination", watch.destination_id),
+        )
+      : null;
   }
   start() {
     if (this.timer || this.closed) return;
@@ -194,7 +242,7 @@ export class ReplyWatches {
           id: w.id,
           state: w.state,
           expires_at: w.expires_at,
-          delivery: w.notify ? "postbag" : "pull_only",
+          delivery: w.destination_id ? "postbag" : "pull_only",
         })),
     };
   }
@@ -213,15 +261,6 @@ export class ReplyWatches {
       throw new BridgeError("not_found_or_not_permitted");
     this.store.authorize(p, watch.chat_id);
     return watch;
-  }
-  private revision() {
-    return z
-      .object({ value: z.number() })
-      .parse(
-        this.store.db
-          .prepare("SELECT value FROM message_revision_counter WHERE id=1")
-          .get(),
-      ).value;
   }
   private version(id: string): Versioned | null {
     const message = this.store.findMessage(id);
@@ -286,7 +325,7 @@ export class ReplyWatches {
       );
   }
   private notice(watch: Watch, kind: string) {
-    if (!watch.notify) return;
+    if (!watch.destination_id) return;
     const upto =
       this.decisions(watch.id)
         .filter((d) => this.visible(d))
@@ -294,7 +333,7 @@ export class ReplyWatches {
     if (kind === "reply_candidates") {
       const previous = this.store.db
         .prepare(
-          "SELECT id FROM reply_notices WHERE watch=? AND kind=? AND state IN ('pending','attempting','submitted','unknown','unavailable') LIMIT 1",
+          "SELECT id FROM reply_notices WHERE watch=? AND kind=? AND state='pending' LIMIT 1",
         )
         .get(watch.id, kind);
       if (previous) {
@@ -318,20 +357,19 @@ export class ReplyWatches {
       .run(watch.id, kind, upto);
   }
   private public(watch: Watch) {
-    const { notify, fingerprint, ...safe } = watch;
+    const { fingerprint, destination_id, ...safe } = watch;
+    const notify = this.destination(watch);
     return {
       ...safe,
       chat_id: this.store.chatId(watch.chat_id),
       notify: notify
         ? { bag: notify.bag, peer: notify.peer, service: notify.service }
         : null,
-      delivery: watch.notify ? "postbag" : "pull_only",
+      delivery: notify ? "postbag" : "pull_only",
       notification_warning:
-        watch.notify_expires_at &&
-        Date.parse(watch.notify_expires_at) <
-          Date.parse(watch.expires_at) +
-            (watch.state === "prepared" ? watch.timeout_seconds * 1000 : 0)
-          ? "Postbag grant may expire before this subscription finishes. Renew it from the receiving session and call watch_replies with the same request_id and fresh token."
+        notify?.expires_at &&
+        Date.parse(notify.expires_at) < Date.parse(watch.expires_at)
+          ? "Postbag grant expires before this subscription. Renew it once for this destination using watch_replies with the same request_id and fresh token."
           : null,
       classifier: this.settings.classifier
         ? {
@@ -355,58 +393,6 @@ export class ReplyWatches {
         "invalid_argument",
         "Choose message_ids or draft_ids",
       );
-    const messages = (q.message_ids ?? []).map((id) => this.store.message(id));
-    const drafts = (q.draft_ids ?? []).map((id) => {
-      const draft = this.store.draft(id);
-      if (
-        draft.clientId !== p.id ||
-        !["pending", "accepted"].includes(draft.status)
-      )
-        throw new BridgeError("not_found_or_not_permitted");
-      return draft;
-    });
-    const chats = new Set([
-      ...messages.map((m) => this.store.chatId(m.chatId)),
-      ...drafts.map((d) => this.store.chatId(d.input.chat_id)),
-    ]);
-    if (
-      chats.size !== 1 ||
-      messages.some((m) => m.deleted || m.direction !== "outgoing")
-    )
-      throw new BridgeError(
-        "invalid_argument",
-        "Watch live outgoing messages in one chat",
-      );
-    if (this.watches().filter((w) => w.client_id === p.id).length >= 1000)
-      throw new BridgeError(
-        "busy",
-        "Subscription storage limit reached; terminal subscriptions are retained for seven days",
-      );
-    const chat = [...chats][0]!;
-    this.store.authorize(p, chat);
-    const originalSize =
-      messages.reduce((s, m) => s + m.text.length, 0) +
-      drafts.reduce((s, d) => s + d.input.text.length, 0);
-    if (originalSize > this.settings.max_context_characters / 2)
-      throw new BridgeError(
-        "invalid_argument",
-        "Original messages exceed the classifier context budget",
-      );
-    let notifyExpiresAt: string | null = null;
-    if (q.notify) {
-      try {
-        const check = await this.notifier.check(
-          q.notify,
-          AbortSignal.timeout(5000),
-        );
-        notifyExpiresAt = check?.expires_at ?? null;
-      } catch {
-        throw new BridgeError(
-          "notification_unavailable",
-          "Postbag service grant is unavailable; grant this service access from the receiving agent session",
-        );
-      }
-    }
     const fingerprint = hash({
       ...q,
       notify: q.notify ? { ...q.notify, service_token: undefined } : undefined,
@@ -414,77 +400,113 @@ export class ReplyWatches {
     const existing = this.watches().find(
       (w) => w.client_id === p.id && w.request_id === q.request_id,
     );
+    if (existing && existing.fingerprint !== fingerprint)
+      throw new BridgeError("request_conflict");
+    let chat: string, start: number;
     if (existing) {
-      if (existing.fingerprint !== fingerprint)
-        throw new BridgeError("request_conflict");
-      if (q.notify) {
-        existing.notify = q.notify;
-        existing.notify_expires_at = notifyExpiresAt;
-        this.save(existing);
-        this.store.db
-          .prepare(
-            "UPDATE reply_notices SET state='pending',attempts=0,next_at=0 WHERE watch=? AND state IN ('failed','exhausted','unavailable')",
-          )
-          .run(existing.id);
-      }
-      return this.public(existing);
-    }
-    if (
-      this.watches().filter(
-        (w) => w.client_id === p.id && ["active", "prepared"].includes(w.state),
-      ).length >= 10
-    )
-      throw new BridgeError(
-        "busy",
-        "At most ten active reply subscriptions per agent key",
+      this.own(p, existing.id);
+      chat = existing.chat_id;
+      start = Date.parse(existing.started_at);
+    } else {
+      const messages = (q.message_ids ?? []).map((id) =>
+        this.store.message(id),
       );
-    const now = this.now(),
-      prepared = drafts.some((d) => d.status === "pending");
-    const start = prepared
-      ? now
-      : Math.min(
-          now,
-          ...messages.map((m) => Date.parse(m.sentAt ?? m.observedAt)),
-          ...drafts.map((d) => Date.parse(d.createdAt)),
+      const drafts = (q.draft_ids ?? []).map((id) => {
+        const d = this.store.draft(id);
+        if (d.clientId !== p.id || d.status !== "accepted")
+          throw new BridgeError(
+            "invalid_argument",
+            "Subscribe after the draft has been sent and accepted",
+          );
+        return d;
+      });
+      const chats = new Set([
+        ...messages.map((m) => this.store.chatId(m.chatId)),
+        ...drafts.map((d) => this.store.chatId(d.input.chat_id)),
+      ]);
+      if (
+        chats.size !== 1 ||
+        messages.some((m) => m.deleted || m.direction !== "outgoing")
+      )
+        throw new BridgeError(
+          "invalid_argument",
+          "Watch live outgoing messages in one chat",
         );
+      chat = [...chats][0]!;
+      this.store.authorize(p, chat);
+      const size =
+        messages.reduce((n, m) => n + m.text.length, 0) +
+        drafts.reduce((n, d) => n + d.input.text.length, 0);
+      if (size > this.settings.max_context_characters / 2)
+        throw new BridgeError(
+          "invalid_argument",
+          "Original messages exceed the classifier context budget",
+        );
+      start = Math.min(
+        this.now(),
+        ...messages.map((m) => Date.parse(m.sentAt ?? m.observedAt)),
+        ...drafts.map((d) => Date.parse(d.attemptedAt ?? d.createdAt)),
+      );
+    }
+    let destinationId: string | null = null;
+    if (q.notify) {
+      let expires_at: string | null;
+      try {
+        expires_at =
+          (await this.notifier.check(q.notify, AbortSignal.timeout(5000)))
+            ?.expires_at ?? null;
+      } catch {
+        throw new BridgeError(
+          "notification_unavailable",
+          "Postbag service grant is unavailable; grant access from the receiving agent session",
+        );
+      }
+      // The preflight awaited another process; authorization may have changed.
+      this.store.requirePrincipal(p);
+      destinationId = this.destinationId(p.id, q.notify);
+      this.store.transaction(() => {
+        this.store.put("reply-destination", destinationId!, {
+          ...q.notify,
+          id: destinationId,
+          client_id: p.id,
+          expires_at,
+        });
+        for (const w of this.watches().filter(
+          (w) => w.destination_id === destinationId,
+        ))
+          this.store.db
+            .prepare(
+              "UPDATE reply_notices SET state='pending',attempts=0,next_at=0 WHERE watch=? AND state='failed'",
+            )
+            .run(w.id);
+      });
+    }
+    if (existing) return this.public(this.load(existing.id));
+    const watches = this.watches().filter((w) => w.client_id === p.id);
+    if (
+      watches.length >= 1000 ||
+      watches.filter((w) => w.state === "active").length >= 10
+    )
+      throw new BridgeError("busy", "Subscription limit reached");
+    const { notify, ...scope } = q;
     const watch: Watch = {
-      ...q,
+      ...scope,
       id: this.store.uuid("watch"),
       client_id: p.id,
       chat_id: chat,
-      state: prepared ? "prepared" : "active",
-      created_at: new Date(now).toISOString(),
+      destination_id: destinationId,
+      state: "active",
+      created_at: new Date(this.now()).toISOString(),
       started_at: new Date(start).toISOString(),
-      expires_at: new Date(now + q.timeout_seconds * 1000).toISOString(),
-      cursor_rev: prepared ? this.revision() : -1,
-      acked_cursor: 0,
-      issued_cursor: 0,
+      expires_at: new Date(start + q.timeout_seconds * 1000).toISOString(),
+      cursor_rev: -1,
       calls_used: 0,
       pending_since: null,
       error: null,
-      notify_expires_at: notifyExpiresAt,
       fingerprint,
     };
     this.save(watch);
     return this.public(watch);
-  }
-  armDraft(draftId: string) {
-    for (const watch of this.watches())
-      if (watch.state === "prepared" && watch.draft_ids?.includes(draftId)) {
-        const now = this.now();
-        if (now >= Date.parse(watch.expires_at)) {
-          watch.state = "expired";
-          this.save(watch);
-          this.notice(watch, "expired_before_send");
-          continue;
-        }
-        watch.state = "active";
-        watch.started_at = new Date(now).toISOString();
-        watch.expires_at = new Date(
-          now + watch.timeout_seconds * 1000,
-        ).toISOString();
-        this.save(watch);
-      }
   }
   private originalIds(watch: Watch) {
     return [
@@ -520,7 +542,7 @@ export class ReplyWatches {
         : null,
     };
   }
-  private context(watch: Watch, candidates: Versioned[]): ReplyContext {
+  private context(watch: Watch, candidates: Versioned[]): ReplyContext | null {
     const originals = (watch.message_ids ?? []).flatMap((id) => {
       const v = this.version(id);
       return v ? [this.asContext(v)] : [];
@@ -593,12 +615,12 @@ export class ReplyWatches {
       context.omitted_context_messages++;
     }
     if (JSON.stringify(context).length > this.settings.max_context_characters)
-      throw new Error("Candidate context exceeds budget");
+      return null;
     return context;
   }
   private expire() {
     for (const watch of this.watches()) {
-      if (!["active", "prepared"].includes(watch.state)) continue;
+      if (watch.state !== "active") continue;
       const principal = this.store
         .clients()
         .find((p) => p.id === watch.client_id && p.enabled);
@@ -606,7 +628,6 @@ export class ReplyWatches {
       if (!expired && principal) continue;
       this.controllers.get(watch.id)?.abort();
       this.store.transaction(() => {
-        const prepared = watch.state === "prepared";
         watch.state = principal ? "expired" : "cancelled";
         const uncertain = this.decisions(watch.id).filter(
           (d) => d.label === "uncertain",
@@ -616,7 +637,7 @@ export class ReplyWatches {
           if (v)
             this.decide(watch, v, "possible", d.reason, d.checked_count + 1);
         }
-        if (principal && !prepared) {
+        if (principal) {
           const rows = this.store.db
             .prepare(
               "SELECT value,rev FROM messages WHERE chat=? AND rev>? AND json_extract(value,'$.direction')='incoming' AND coalesce(sent,observed)>=? AND coalesce(sent,observed)<?",
@@ -658,15 +679,11 @@ export class ReplyWatches {
         const decisions = this.decisions(watch.id);
         const kind = !principal
           ? "cancelled"
-          : prepared
-            ? "expired_before_send"
-            : watch.error || decisions.some((d) => d.label === "unclassified")
-              ? "expired_unclassified"
-              : decisions.some((d) =>
-                    ["relevant", "possible"].includes(d.label),
-                  )
-                ? "expired_with_replies"
-                : "expired_no_reply";
+          : watch.error || decisions.some((d) => d.label === "unclassified")
+            ? "expired_unclassified"
+            : decisions.some((d) => ["relevant", "possible"].includes(d.label))
+              ? "expired_with_replies"
+              : "expired_no_reply";
         this.notice(watch, kind);
       });
     }
@@ -727,20 +744,19 @@ export class ReplyWatches {
     const start = this.nextWatch % Math.max(1, active.length);
     for (let index = 0; index < active.length; index++) {
       const position = (start + index) % active.length;
-      const initial = active[position]!;
-      let watch = this.load(initial.id);
-      const rows = this.store.db
+      let watch = this.load(active[position]!.id);
+      const versions = this.store.db
         .prepare(
           "SELECT value,rev FROM messages WHERE chat=? AND rev>? ORDER BY rev LIMIT 100",
         )
-        .all(this.store.chatId(watch.chat_id), watch.cursor_rev);
-      const versions = rows.map((row) => {
-        const r = z.object({ value: z.string(), rev: z.number() }).parse(row);
-        return {
-          message: messageSchema.parse(JSON.parse(r.value)),
-          rev: r.rev,
-        };
-      });
+        .all(this.store.chatId(watch.chat_id), watch.cursor_rev)
+        .map((row) => {
+          const r = z.object({ value: z.string(), rev: z.number() }).parse(row);
+          return {
+            message: messageSchema.parse(JSON.parse(r.value)),
+            rev: r.rev,
+          };
+        });
       const candidates = versions.filter(
         ({ message: m }) =>
           m.direction === "incoming" &&
@@ -782,54 +798,59 @@ export class ReplyWatches {
         this.now() - first < this.settings.max_batch_delay_seconds * 1000
       )
         continue;
-      const originalIds = this.originalIds(watch),
-        batch: Versioned[] = [];
-      const visibleBefore = hash(
-        this.decisions(watch.id)
-          .filter((d) => this.visible(d) && d.label !== "unclassified")
-          .map((d) => [d.id, d.label]),
-      );
+      const originals = this.originalIds(watch),
+        batch: Versioned[] = [],
+        handled = new Set<number>();
+      const staged: {
+        v: Versioned;
+        label: Decision["label"];
+        reason: string;
+        checked: number;
+      }[] = [];
+      const stage = (
+        v: Versioned,
+        label: Decision["label"],
+        reason: string,
+        checked = 1,
+      ) => staged.push({ v, label, reason, checked });
+      let warning = false;
       for (const v of [...candidates, ...pending].slice(0, 20)) {
         const previous = this.lastDecision(watch.id, v.message.providerId);
-        if (previous?.label === "uncertain" && versions.length === 0) {
-          this.decide(
-            watch,
-            v,
-            "possible",
-            previous.reason,
-            previous.checked_count + 1,
-          );
-          continue;
-        }
         if (v.message.deleted) {
           if (previous)
-            this.decide(
-              watch,
-              v,
-              previous.label,
-              "Message deleted",
-              previous.checked_count,
-            );
-          continue;
-        }
-        if (
+            stage(v, previous.label, "Message deleted", previous.checked_count);
+        } else if (previous?.label === "uncertain" && versions.length === 0) {
+          stage(v, "possible", previous.reason, previous.checked_count + 1);
+        } else if (
           previous &&
           previous.fingerprint === semanticFingerprint(v.message) &&
           previous.label !== "uncertain"
         ) {
-          continue;
-        }
-        if (
+          // Identity-only revisions do not create another decision.
+        } else if (
           v.message.replyId &&
-          originalIds.includes(
+          originals.includes(
             this.store.resolveId("message-alias", v.message.replyId),
           )
         ) {
-          this.decide(watch, v, "relevant", "Explicit quoted reply");
-          continue;
+          stage(v, "relevant", "Explicit quoted reply");
+        } else {
+          if (!this.context(watch, [...batch, v])) {
+            if (this.context(watch, [v])) break;
+            stage(
+              v,
+              "unclassified",
+              "Message exceeds the classifier context budget",
+            );
+            warning = true;
+            handled.add(v.rev);
+            continue;
+          }
+          batch.push(v);
         }
-        batch.push(v);
+        handled.add(v.rev);
       }
+      let error = watch.error;
       if (batch.length) {
         const controller = new AbortController();
         this.controllers.set(watch.id, controller);
@@ -844,16 +865,13 @@ export class ReplyWatches {
             throw new Error("Classifier call budget exhausted");
           watch.calls_used++;
           this.save(watch);
+          const packet = this.context(watch, batch);
+          if (!packet)
+            throw new Error("Original context changed beyond budget");
           const result = classificationSchema.parse(
-            await this.classify(this.context(watch, batch), controller.signal),
+            await this.classify(packet, controller.signal),
           );
-          watch = this.load(watch.id);
-          if (
-            watch.state !== "active" ||
-            controller.signal.aborted ||
-            this.now() >= Date.parse(watch.expires_at)
-          )
-            continue;
+          if (controller.signal.aborted) continue;
           const expected = new Map(batch.map((v) => [v.message.id, v]));
           if (
             result.results.length !== expected.size ||
@@ -864,80 +882,66 @@ export class ReplyWatches {
             )
           )
             throw new Error("Classifier returned invalid candidate identities");
-          watch.error = null;
-          this.store.transaction(() => {
-            for (const r of result.results) {
-              const v = expected.get(r.message_id)!;
-              if (this.version(v.message.id)?.rev !== v.rev) continue;
-              const previous = this.lastDecision(
-                watch.id,
-                v.message.providerId,
-              );
-              const checked =
-                (previous?.label === "uncertain" ? previous.checked_count : 0) +
-                1;
-              this.decide(
-                watch,
-                v,
-                r.label === "uncertain" && checked >= 2 ? "possible" : r.label,
-                r.reason,
-                checked,
-              );
-            }
-          });
+          error = null;
+          for (const r of result.results) {
+            const v = expected.get(r.message_id)!;
+            const previous = this.lastDecision(watch.id, v.message.providerId);
+            const checked =
+              (previous?.label === "uncertain" ? previous.checked_count : 0) +
+              1;
+            stage(
+              v,
+              r.label === "uncertain" && checked >= 2 ? "possible" : r.label,
+              r.reason,
+              checked,
+            );
+          }
         } catch {
-          watch = this.load(watch.id);
-          if (
-            watch.state !== "active" ||
-            this.now() >= Date.parse(watch.expires_at)
-          )
-            continue;
-          watch.error =
+          error =
             "Classifier unavailable, timed out, exceeded budget, or returned invalid output";
+          warning = true;
           for (const v of batch)
-            if (this.version(v.message.id)?.rev === v.rev) {
-              const previous = this.lastDecision(
-                watch.id,
-                v.message.providerId,
-              );
-              this.decide(
-                watch,
-                v,
-                "unclassified",
-                watch.error,
-                (previous?.checked_count ?? 0) + 1,
-              );
-            }
-          this.notice(watch, "classifier_unavailable");
+            stage(
+              v,
+              "unclassified",
+              error,
+              (this.lastDecision(watch.id, v.message.providerId)
+                ?.checked_count ?? 0) + 1,
+            );
         } finally {
           clearTimeout(timer);
           this.controllers.delete(watch.id);
         }
       }
-      watch = { ...this.load(watch.id), error: watch.error };
+      watch = this.load(watch.id);
       if (
         watch.state !== "active" ||
         this.now() >= Date.parse(watch.expires_at)
       )
         continue;
-      // Never advance past a candidate omitted by the per-call batch bound.
-      const omitted = candidates.slice(20)[0]?.rev;
-      watch.cursor_rev = Math.max(
-        watch.cursor_rev,
-        ...versions
-          .filter((v) => omitted === undefined || v.rev < omitted)
-          .map((v) => v.rev),
-      );
-      watch.pending_since = null;
       this.store.transaction(() => {
-        this.save(watch);
-        const visibleAfter = hash(
-          this.decisions(watch.id)
-            .filter((d) => this.visible(d) && d.label !== "unclassified")
-            .map((d) => [d.id, d.label]),
+        const visible = () =>
+          hash(
+            this.decisions(watch.id)
+              .filter((d) => this.visible(d) && d.label !== "unclassified")
+              .map((d) => [d.id, d.label]),
+          );
+        const before = visible();
+        for (const d of staged)
+          if (this.version(d.v.message.id)?.rev === d.v.rev)
+            this.decide(watch, d.v, d.label, d.reason, d.checked);
+        const omitted = candidates.find((v) => !handled.has(v.rev))?.rev;
+        watch.cursor_rev = Math.max(
+          watch.cursor_rev,
+          ...versions
+            .filter((v) => omitted === undefined || v.rev < omitted)
+            .map((v) => v.rev),
         );
-        if (visibleBefore !== visibleAfter)
-          this.notice(watch, "reply_candidates");
+        watch.pending_since = null;
+        watch.error = error;
+        this.save(watch);
+        if (before !== visible()) this.notice(watch, "reply_candidates");
+        if (warning) this.notice(watch, "classifier_unavailable");
       });
       this.nextWatch = (position + 1) % active.length;
       return;
@@ -946,26 +950,27 @@ export class ReplyWatches {
   private async deliver() {
     const rows = this.store.db
       .prepare(
-        "SELECT * FROM reply_notices WHERE state IN ('pending','unavailable') AND next_at<=? ORDER BY id LIMIT 5",
+        "SELECT * FROM reply_notices WHERE state='pending' AND next_at<=? ORDER BY id LIMIT 5",
       )
       .all(this.now());
     for (const row of rows) {
       if (this.closed) return;
       const n = noticeSchema.parse(row),
         watch = this.load(n.watch);
+      const destination = this.destination(watch);
       if (
-        !watch.notify ||
+        !destination ||
         !this.store.clients().some((p) => p.id === watch.client_id && p.enabled)
       ) {
         this.store.db
-          .prepare("UPDATE reply_notices SET state='superseded' WHERE id=?")
+          .prepare("UPDATE reply_notices SET state='failed' WHERE id=?")
           .run(n.id);
         continue;
       }
       // Obsolete candidate hints are replaced by the terminal notice.
       if (watch.state !== "active" && n.kind === "reply_candidates") {
         this.store.db
-          .prepare("UPDATE reply_notices SET state='superseded' WHERE id=?")
+          .prepare("UPDATE reply_notices SET state='failed' WHERE id=?")
           .run(n.id);
         continue;
       }
@@ -974,33 +979,45 @@ export class ReplyWatches {
         this.now() > Date.parse(watch.expires_at) + 7 * 86400000
       ) {
         this.store.db
-          .prepare("UPDATE reply_notices SET state='exhausted' WHERE id=?")
+          .prepare("UPDATE reply_notices SET state='failed' WHERE id=?")
           .run(n.id);
         continue;
       }
       this.store.db
         .prepare(
-          "UPDATE reply_notices SET state='attempting',attempts=attempts+1 WHERE id=?",
+          "UPDATE reply_notices SET state='sending',attempts=attempts+1 WHERE id=?",
         )
         .run(n.id);
-      let state: Notice["state"] = "unknown";
+      let state: Notice["state"] = "pending";
       const controller = new AbortController();
       this.deliveryController = controller;
       const timer = setTimeout(() => controller.abort(), 35000);
       try {
-        state = await this.notifier.send(
-          watch.notify,
-          { watch_id: watch.id, notice_id: n.id, kind: n.kind },
+        const result = await this.notifier.send(
+          destination,
+          { watch_id: watch.id, notice_id: n.id, kind: n.kind, upto: n.upto },
           controller.signal,
         );
+        state =
+          result === "submitted"
+            ? "sent"
+            : result === "failed"
+              ? "failed"
+              : "pending";
       } catch {
       } finally {
         clearTimeout(timer);
         this.deliveryController = undefined;
       }
+      if (
+        state !== "sent" &&
+        this.destination(this.load(watch.id))?.service_token !==
+          destination.service_token
+      )
+        state = "pending";
       this.store.db
         .prepare(
-          "UPDATE reply_notices SET state=?,next_at=? WHERE id=? AND state='attempting'",
+          "UPDATE reply_notices SET state=?,next_at=? WHERE id=? AND state='sending'",
         )
         .run(
           state,
@@ -1016,33 +1033,17 @@ export class ReplyWatches {
       .object({
         watch_id: z.string(),
         after: z.number().int().min(0).default(0),
-        ack_through: z.number().int().min(0).optional(),
         include_unrelated: z.boolean().default(false),
         limit: z.number().int().min(1).max(100).default(50),
       })
       .strict()
       .parse(input);
     const watch = this.own(p, q.watch_id);
-    if (q.ack_through !== undefined) {
-      if (q.ack_through > watch.issued_cursor)
-        throw new BridgeError(
-          "invalid_argument",
-          "Cannot acknowledge a cursor that has not been read",
-        );
-      watch.acked_cursor = Math.max(watch.acked_cursor, q.ack_through);
-      this.store.db
-        .prepare(
-          "UPDATE reply_notices SET state='acknowledged' WHERE watch=? AND upto<=?",
-        )
-        .run(watch.id, watch.acked_cursor);
-    }
     const all = this.decisions(watch.id).filter(
       (d) => d.id > q.after && (q.include_unrelated || this.visible(d)),
     );
     const items = all.slice(0, q.limit);
     const cursor = items.at(-1)?.id ?? q.after;
-    watch.issued_cursor = Math.max(watch.issued_cursor, cursor);
-    this.save(watch);
     return {
       watch: this.public(watch),
       replies: items.map((d) => {
@@ -1068,7 +1069,7 @@ export class ReplyWatches {
   }
   cancel(p: Principal, id: string) {
     const watch = this.own(p, id);
-    if (["prepared", "active"].includes(watch.state)) {
+    if (watch.state === "active") {
       watch.state = "cancelled";
       this.controllers.get(id)?.abort();
       this.store.transaction(() => {

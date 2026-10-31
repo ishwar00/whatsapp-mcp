@@ -265,11 +265,12 @@ export class Service {
     );
     if (actual !== draft.digest) throw new BridgeError("request_conflict");
     if (!this.sender.connected) throw new BridgeError("service_offline");
-    draft = { ...draft, status: "attempting" };
-    this.store.transaction(() => {
-      this.store.saveDraft(draft);
-      this.replies?.armDraft(draft.id);
-    });
+    draft = {
+      ...draft,
+      status: "attempting",
+      attemptedAt: new Date().toISOString(),
+    };
+    this.store.saveDraft(draft);
     try {
       const providerId = await this.sender.send(draft);
       draft = { ...draft, status: "accepted", providerId };

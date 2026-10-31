@@ -112,6 +112,7 @@ export const draftSchema = z.object({
     "failed_before_attempt",
   ]),
   createdAt: z.string(),
+  attemptedAt: z.string().optional(),
   providerId: z.string().nullable(),
   error: z.string().nullable(),
 });

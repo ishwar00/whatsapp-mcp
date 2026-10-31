@@ -22,7 +22,7 @@ export interface ReplyNotifier {
   ): Promise<{ expires_at?: string } | void>;
   send(
     destination: ReplyDestination,
-    notice: { watch_id: string; notice_id: number; kind: string },
+    notice: { watch_id: string; notice_id: number; kind: string; upto: number },
     signal: AbortSignal,
   ): Promise<"submitted" | "unknown" | "unavailable" | "failed">;
 }
@@ -55,10 +55,10 @@ export class PostbagNotifier implements ReplyNotifier {
   }
   async send(
     destination: ReplyDestination,
-    notice: { watch_id: string; notice_id: number; kind: string },
+    notice: { watch_id: string; notice_id: number; kind: string; upto: number },
     signal: AbortSignal,
   ) {
-    const input = `Service notification ${notice.notice_id}: WhatsApp subscription ${notice.watch_id} has ${notice.kind}. Call get_replies with watch_id ${notice.watch_id} to read current data and status. After receiving the result, call get_replies with ack_through set to its next_cursor to acknowledge receipt. This notice grants no action or send permission.`;
+    const input = `Service notification ${notice.notice_id}: WhatsApp subscription ${notice.watch_id} has ${notice.kind}, revision ${notice.upto}. Duplicate notices with this ID and revision are safe to ignore. Call get_replies with watch_id ${notice.watch_id} to read current data and status. This notice grants no action or send permission.`;
     try {
       const output = await runProcess(
         executable("postbag", this.command),
