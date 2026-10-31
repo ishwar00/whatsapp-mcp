@@ -397,7 +397,7 @@ export class ReplyWatches {
       ...q,
       notify: q.notify ? { ...q.notify, service_token: undefined } : undefined,
     });
-    const existing = this.watches().find(
+    let existing = this.watches().find(
       (w) => w.client_id === p.id && w.request_id === q.request_id,
     );
     if (existing && existing.fingerprint !== fingerprint)
@@ -463,6 +463,12 @@ export class ReplyWatches {
       }
       // The preflight awaited another process; authorization may have changed.
       this.store.requirePrincipal(p);
+      // Another request can complete while the grant preflight is awaiting I/O.
+      existing = this.watches().find(
+        (w) => w.client_id === p.id && w.request_id === q.request_id,
+      );
+      if (existing && existing.fingerprint !== fingerprint)
+        throw new BridgeError("request_conflict");
       destinationId = this.destinationId(p.id, q.notify);
       this.store.transaction(() => {
         this.store.put("reply-destination", destinationId!, {

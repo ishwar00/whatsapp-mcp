@@ -760,3 +760,23 @@ test("unknown pointer submissions retry the same notice identity without an ackn
     await f.close();
   }
 });
+
+test("concurrent notification preflights preserve request idempotency", async () => {
+  const f = fixture();
+  try {
+    const [a, b] = await Promise.all([
+      f.create({ request_id: "concurrent" }),
+      f.create({ request_id: "concurrent" }),
+    ]);
+    assert.equal(a.id, b.id);
+    assert.equal(f.store.all("reply-watch").length, 1);
+    const other = await Promise.allSettled([
+      f.create({ request_id: "conflict", waiting_for: "records" }),
+      f.create({ request_id: "conflict", waiting_for: "something else" }),
+    ]);
+    assert.equal(other.filter((r) => r.status === "fulfilled").length, 1);
+    assert.equal(other.filter((r) => r.status === "rejected").length, 1);
+  } finally {
+    await f.close();
+  }
+});
