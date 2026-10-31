@@ -35,6 +35,38 @@ Old IDs redirect to the retained row, so drafts and reply references survive. A
 deletion wins over duplicate content; otherwise the latest edit wins. Attachments
 move to the retained message before the losing message is deleted.
 
+## History retrieval
+
+`history.ts` owns a bounded queue of persisted per-chat history jobs. MCP callers
+start a job and poll its state while `whatsapp.ts` requests batches from the phone.
+Incoming history is ingested through the same message, identity, edit, and media
+paths as other messages. Matching history events wake the job; request submission
+alone does not mean messages arrived. Timeouts and no-progress responses stop it.
+
+Jobs use an explicit raw-message anchor, or choose one near the requested range end.
+Each completed correlated response supplies the next anchor. Sparse stored date
+bounds cannot satisfy a new fetch. Early responses are buffered until dispatch
+returns its ID; no chat-based fallback or fixed sleep establishes completion.
+Matching data without a completion marker remains available but ends as incomplete
+at the deadline. Retrieved messages are shared across local clients through SQLite.
+Coverage lives in local read results; network fetching is a separate explicit action.
+The owner history endpoint uses the same queue and job format as MCP.
+
+New pairings request full history using the default Chrome profile. Existing
+pairings preserve their saved sync preference. Both sync modes keep the same
+browser identity; WhatsApp controls how much history it shares. Installation applies
+one pinned Baileys rc14 capability correction: `supportGroupHistory: true` in the
+registration bytes. Otherwise the phone omits messages it imported from shared
+group history. This capability is stored at pairing, so an existing pairing that
+advertised false needs to be linked again. Tests decode the actual registration
+bytes and check the patch is idempotent.
+
+Edited history retains the provider's original sent time, separately from edit
+time. If the base message arrives after an edit, only missing date metadata is
+filled; edited content and its raw payload remain intact. Media refresh normalizes
+historical group sender keys and handles both native HTTP and Boom status codes.
+A phone response of NOT_FOUND leaves the message and attachment metadata available.
+
 ## Access and approval
 
 Agent bearer keys can read all chats. Draft and send permissions are separate.

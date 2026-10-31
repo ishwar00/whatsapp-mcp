@@ -8,7 +8,8 @@ dist/
 .env*
 !.env.example
 public/
-scripts/
+scripts/*
+!scripts/patch-baileys.mjs
 docs/*
 !docs/mcp-contract.md
 .DS_Store

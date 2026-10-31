@@ -345,6 +345,65 @@ export class Store {
         this.eraseMessage(message.id);
     }
   }
+  historyCoverage(chatId?: string) {
+    const id = chatId ? this.chat(chatId).id : null;
+    const row = this.db
+      .prepare(
+        `SELECT count(*) AS count, min(sent) AS oldest, max(sent) AS newest
+      FROM messages WHERE json_extract(value,'$.deleted')=0 AND sent IS NOT NULL
+      ${id ? "AND chat=?" : ""}`,
+      )
+      .get(...(id ? [id] : []));
+    const result = z
+      .object({
+        count: z.number(),
+        oldest: z.string().nullable(),
+        newest: z.string().nullable(),
+      })
+      .parse(row);
+    return {
+      chat_id: id,
+      stored_messages: result.count,
+      oldest_message_at: result.oldest,
+      newest_message_at: result.newest,
+      completeness: "unknown",
+      gaps: "unknown",
+    };
+  }
+  historyAnchor(
+    chatId: string,
+    options: { messageId?: string; atOrAfter?: string } = {},
+  ) {
+    const chat = this.chat(chatId);
+    const base = `SELECT m.value FROM messages m JOIN objects r ON r.kind='raw' AND r.id=m.id
+      WHERE m.chat=? AND json_extract(m.value,'$.deleted')=0 AND m.sent IS NOT NULL
+      AND EXISTS (SELECT 1 FROM json_each(r.value,'$.message') field
+        WHERE field.key NOT IN ('messageContextInfo','senderKeyDistributionMessage'))`;
+    let row;
+    if (options.messageId) {
+      row = this.db
+        .prepare(`${base} AND m.id=?`)
+        .get(chat.id, this.resolveId("message-alias", options.messageId));
+    } else if (options.atOrAfter) {
+      row = this.db
+        .prepare(
+          `${base} AND m.sent>=? ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`,
+        )
+        .get(chat.id, new Date(options.atOrAfter).toISOString());
+      row ??= this.db
+        .prepare(
+          `${base} ORDER BY coalesce(m.sent,m.observed) DESC,m.id DESC LIMIT 1`,
+        )
+        .get(chat.id);
+    } else {
+      row = this.db
+        .prepare(`${base} ORDER BY coalesce(m.sent,m.observed),m.id LIMIT 1`)
+        .get(chat.id);
+    }
+    return row
+      ? messageSchema.parse(JSON.parse(rowSchema.parse(row).value))
+      : null;
+  }
   prune(days = 90) {
     const cutoff = new Date(Date.now() - days * 86400000).toISOString();
     for (const row of this.db
@@ -541,13 +600,19 @@ export class Store {
       ...side(">", "ASC", after),
     ];
   }
-  message(id: string) {
+  findMessage(id: string) {
     id = this.resolveId("message-alias", id);
     const row = this.db
       .prepare("SELECT value FROM messages WHERE id=?")
       .get(id);
-    if (!row) throw new BridgeError("not_found_or_not_permitted");
-    return messageSchema.parse(JSON.parse(rowSchema.parse(row).value));
+    return row
+      ? messageSchema.parse(JSON.parse(rowSchema.parse(row).value))
+      : null;
+  }
+  message(id: string) {
+    const message = this.findMessage(id);
+    if (!message) throw new BridgeError("not_found_or_not_permitted");
+    return message;
   }
   saveMessage(message: Message) {
     message = {
@@ -567,11 +632,18 @@ export class Store {
           (prior.editedAt &&
             (!message.editedAt ||
               Date.parse(message.editedAt) <= Date.parse(prior.editedAt))))
-      )
+      ) {
+        if (!prior.deleted && !prior.sentAt && message.sentAt)
+          this.writeMessage({
+            ...prior,
+            sentAt: message.sentAt,
+            updatedAt: message.updatedAt,
+          });
         return false;
+      }
       message.observedAt = prior.observedAt;
       if (message.editedAt) {
-        message.sentAt = prior.sentAt;
+        message.sentAt = prior.sentAt ?? message.sentAt;
         message.senderId = prior.senderId;
         message.senderName = prior.senderName;
         message.direction = prior.direction;

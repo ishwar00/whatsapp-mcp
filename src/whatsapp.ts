@@ -1,12 +1,12 @@
 import makeWASocket, {
   BufferJSON,
-  Browsers,
   DisconnectReason,
   initAuthCreds,
   proto,
   downloadMediaMessage,
   getContentType,
   normalizeMessageContent,
+  toNumber,
   jidNormalizedUser,
   type AuthenticationState,
   type SignalDataTypeMap,
@@ -15,50 +15,12 @@ import makeWASocket, {
   type Contact,
 } from "@whiskeysockets/baileys";
 import pino from "pino";
+import { HistorySync, resolveHistoryMode } from "./history.js";
 import { decryptEdit } from "./encrypted-edit.js";
 import { z } from "zod";
 import { Store, opaque } from "./store.js";
 import { BridgeError, messageSchema, type Draft } from "./domain.js";
 import type { Sender } from "./service.js";
-const keyPair = z.object({
-  public: z.instanceof(Uint8Array),
-  private: z.instanceof(Uint8Array),
-});
-const keySchemas = {
-  "lid-mapping": z.string(),
-  "device-list": z.array(z.string()),
-  tctoken: z.object({
-    token: z.instanceof(Buffer),
-    timestamp: z.string().optional(),
-    senderTimestamp: z.number().optional(),
-  }),
-  "identity-key": z.instanceof(Uint8Array),
-  "pre-key": keyPair,
-  session: z.instanceof(Uint8Array),
-  "sender-key": z.instanceof(Uint8Array),
-  "sender-key-memory": z.record(z.boolean()),
-  "app-state-sync-key": z.object({
-    keyData: z.instanceof(Uint8Array).nullish(),
-    fingerprint: z
-      .object({
-        rawId: z.number().nullish(),
-        currentIndex: z.number().nullish(),
-        deviceIndexes: z.array(z.number()).nullish(),
-      })
-      .nullish(),
-    timestamp: z
-      .union([
-        z.number(),
-        z.object({ low: z.number(), high: z.number(), unsigned: z.boolean() }),
-      ])
-      .nullish(),
-  }),
-  "app-state-sync-version": z.object({
-    version: z.number(),
-    hash: z.instanceof(Buffer),
-    indexValueMap: z.record(z.object({ valueMac: z.instanceof(Uint8Array) })),
-  }),
-};
 function toMessage(value: unknown): WAMessage {
   const message = proto.WebMessageInfo.fromObject(
     z.record(z.unknown()).parse(value),
@@ -73,10 +35,27 @@ function toMessage(value: unknown): WAMessage {
       participantAlt: z.string().optional(),
     })
     .parse(message.key);
-  return { ...message, key };
+  return {
+    ...message,
+    key: {
+      ...key,
+      participant: key.participant || message.participant || undefined,
+    },
+  };
 }
 const logger = pino({ level: "silent" });
 const diagnostics = pino({ level: "info" }, pino.destination(2));
+function httpStatus(error: unknown) {
+  const parsed = z
+    .object({
+      status: z.number().optional(),
+      output: z.object({ statusCode: z.number() }).optional(),
+    })
+    .safeParse(error);
+  return parsed.success
+    ? (parsed.data.output?.statusCode ?? parsed.data.status)
+    : undefined;
+}
 export class WhatsApp implements Sender {
   connected = false;
   ownerIds: string[] = [];
@@ -86,7 +65,15 @@ export class WhatsApp implements Sender {
   stopping = false;
   reconnectAttempt = 0;
   caching = 0;
-  constructor(public store: Store) {}
+  historyMode: "full" | "recent" = "full";
+  readonly history: HistorySync;
+  constructor(public store: Store) {
+    this.history = new HistorySync(store, {
+      connected: () => this.connected,
+      request: (chat, count, anchorId) =>
+        this.requestHistory(chat, count, anchorId),
+    });
+  }
   auth(): AuthenticationState {
     const saved = this.store.get("auth", "creds");
     const creds = saved
@@ -103,13 +90,14 @@ export class WhatsApp implements Sender {
           for (const id of ids) {
             const value = this.store.get("key", `${type}:${id}`);
             if (value) {
-              const parsed = keySchemas[type].parse(value);
+              // Baileys owns these formats. In rc14, Signal sessions are objects
+              // even though SignalDataTypeMap declares Uint8Array.
               result[id] = (
                 type === "app-state-sync-key"
                   ? proto.Message.AppStateSyncKeyData.fromObject(
-                      keySchemas["app-state-sync-key"].parse(value),
+                      z.record(z.unknown()).parse(value),
                     )
-                  : parsed
+                  : value
               ) as SignalDataTypeMap[typeof type];
             }
           }
@@ -181,19 +169,24 @@ export class WhatsApp implements Sender {
   start() {
     if (this.stopping) return;
     const auth = this.auth();
-    const historyMode = this.store.get("setting", "history-mode") === "desktop";
+    this.historyMode = resolveHistoryMode({
+      override: process.env.WHATSAPP_HISTORY_MODE,
+      saved: this.store.get("setting", "history-mode"),
+      paired: Boolean(auth.creds.me),
+    });
+    // Persist the sync preference without changing the paired browser identity.
+    this.store.put("setting", "history-mode", this.historyMode);
+    const historyMode = this.historyMode === "full";
     diagnostics.info({
       event: "wa_connect_start",
-      historyMode: historyMode ? "desktop" : "default",
+      historyMode: this.historyMode,
       registered: auth.creds.registered,
     });
     const sock = makeWASocket({
       auth,
       logger,
       markOnlineOnConnect: false,
-      ...(historyMode
-        ? { browser: Browsers.macOS("Desktop"), syncFullHistory: true }
-        : { syncFullHistory: false }),
+      syncFullHistory: historyMode,
       generateHighQualityLinkPreview: false,
       getMessage: async (key) => {
         if (!key.remoteJid || !key.id) return undefined;
@@ -295,6 +288,7 @@ export class WhatsApp implements Sender {
         isLatest,
         progress,
         lidPnMappings,
+        peerDataRequestSessionId,
       }) => {
         if (this.socket !== sock || this.stopping) return;
         diagnostics.info({
@@ -308,14 +302,38 @@ export class WhatsApp implements Sender {
             ...new Set(messages.map((m) => m.key.remoteJid).filter(Boolean)),
           ].map((jid) => opaque("chat", String(jid))),
         });
+        this.store.put("setting", "history-last-event", {
+          received_at: new Date().toISOString(),
+          sync_type: syncType,
+          messages: messages.length,
+          progress: progress ?? null,
+        });
         for (const mapping of lidPnMappings ?? [])
           this.store.addAlias(mapping.lid, mapping.pn);
         for (const c of chats)
           if (c.id) this.store.saveChat(c.id, c.name ?? undefined);
         for (const contact of contacts) this.saveContact(contact);
-        for (const m of messages) this.ingest(m, "history");
+        const historyMessages: { id: string; added: boolean }[] = [];
+        for (const raw of messages) {
+          const stored = this.ingest(raw, "history");
+          if (stored) historyMessages.push(stored);
+        }
+        if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND)
+          this.history.received({
+            requestId: peerDataRequestSessionId,
+            progress,
+            messages: historyMessages,
+          });
       },
     );
+    sock.ev.on("messaging-history.status", (status) => {
+      if (this.socket !== sock || this.stopping) return;
+      this.store.put("setting", "history-phase", {
+        ...status,
+        updated_at: new Date().toISOString(),
+      });
+      diagnostics.info({ event: "wa_history_phase", ...status });
+    });
     sock.ev.on("messages.upsert", ({ messages }) => {
       if (this.socket !== sock || this.stopping) return;
       for (const m of messages) {
@@ -371,22 +389,22 @@ export class WhatsApp implements Sender {
       }
     });
   }
-  async requestHistory(chatId: string, count: number) {
+  async requestHistory(chatId: string, count: number, anchorId?: string) {
     if (!this.connected || !this.socket)
       throw new BridgeError("service_offline");
     const chat = this.store.chat(chatId);
-    const oldest = this.store
-      .messages([chatId])
-      .filter((m) => m.sentAt && !m.deleted)
-      .sort((a, b) => a.sentAt!.localeCompare(b.sentAt!))[0];
+    const oldest = this.store.historyAnchor(chatId, { messageId: anchorId });
     const value = oldest && this.store.get("raw", oldest.id);
     const anchor = value ? toMessage(value) : undefined;
+    if (!anchor?.key.id || !anchor.messageTimestamp)
+      throw new BridgeError(
+        "history_anchor_missing",
+        "No stored message anchor. Initial history sync or a new message in this chat is needed before fetching older history.",
+      );
     const requestId = await this.socket.fetchMessageHistory(
       count,
-      anchor?.key ?? { remoteJid: chat.jid, fromMe: false },
-      anchor?.messageTimestamp
-        ? Number(anchor.messageTimestamp) * 1000
-        : Date.now(),
+      { ...anchor.key, remoteJid: chat.jid },
+      toNumber(anchor.messageTimestamp) * 1000,
     );
     diagnostics.info({
       event: "wa_history_requested",
@@ -463,8 +481,12 @@ export class WhatsApp implements Sender {
       });
     }
   }
-  ingest(raw: WAMessage, source: "live" | "history", editTime?: string) {
-    const timestamp = Number(raw.messageTimestamp || 0);
+  ingest(
+    raw: WAMessage,
+    source: "live" | "history",
+    editTime?: string,
+  ): { id: string; added: boolean } | undefined {
+    const timestamp = toNumber(raw.messageTimestamp);
     const eventTime =
       timestamp > 0 && timestamp < 8640000000000 && Number.isFinite(timestamp)
         ? new Date(timestamp * 1000).toISOString()
@@ -530,7 +552,7 @@ export class WhatsApp implements Sender {
           protocol.key?.id !== targetId)
       )
         return;
-      this.ingest(
+      const stored = this.ingest(
         {
           ...original,
           message: {
@@ -542,7 +564,7 @@ export class WhatsApp implements Sender {
         eventTime ?? new Date().toISOString(),
       );
       this.store.removeMessageEvent(id);
-      return;
+      return stored;
     }
     if (content.protocolMessage) {
       const protocol = content.protocolMessage;
@@ -552,15 +574,15 @@ export class WhatsApp implements Sender {
       )
         this.store.eraseMessage(this.store.messageId(jid, protocol.key.id));
       if (protocol.editedMessage && protocol.key?.id)
-        this.ingest(
+        return this.ingest(
           {
             ...raw,
             key: { ...raw.key, id: protocol.key.id },
             message: protocol.editedMessage,
           },
           source,
-          protocol.timestampMs && Number(protocol.timestampMs) > 0
-            ? new Date(Number(protocol.timestampMs)).toISOString()
+          protocol.timestampMs && toNumber(protocol.timestampMs) > 0
+            ? new Date(toNumber(protocol.timestampMs)).toISOString()
             : (editedAt ?? eventTime ?? new Date().toISOString()),
         );
       return;
@@ -611,7 +633,10 @@ export class WhatsApp implements Sender {
       content.audioMessage ||
       content.stickerMessage;
     const attachmentId = media ? opaque("attachment", id) : null;
-    const sentAt = editedAt ? null : eventTime;
+    // HistorySync keeps the original sent timestamp even when the payload is an edit.
+    const sentAt = editedAt && source !== "history" ? null : eventTime;
+    const previous = this.store.findMessage(id);
+    const existed = previous !== null;
     const saved = this.store.saveMessage({
       editedAt,
       updatedAt: new Date().toISOString(),
@@ -649,7 +674,19 @@ export class WhatsApp implements Sender {
             ).toISOString()
           : null,
     });
-    if (!saved || this.store.message(id).deleted) return;
+    const current = this.store.message(id);
+    if (current.deleted) return;
+    if (!saved) {
+      if (source === "history" && !previous?.sentAt && current.sentAt) {
+        const retained = this.store.get("raw", id);
+        if (retained)
+          this.store.put("raw", id, {
+            ...z.record(z.unknown()).parse(retained),
+            messageTimestamp: Date.parse(current.sentAt) / 1000,
+          });
+      }
+      return { id: current.id, added: false };
+    }
     const previousRaw = this.store.get("raw", id);
     const previousMessage = previousRaw
       ? proto.WebMessageInfo.fromObject(previousRaw)
@@ -693,6 +730,7 @@ export class WhatsApp implements Sender {
           });
       }
     }
+    return { id: this.store.message(id).id, added: !existed };
   }
   async download(id: string) {
     const parsed = this.store.attachments.get(id);
@@ -700,19 +738,27 @@ export class WhatsApp implements Sender {
     const raw = this.store.get("raw", parsed.messageId);
     if (!raw) throw new Error("Media unavailable");
     const message = toMessage(raw);
-    const stream = await downloadMediaMessage(
-      message,
-      "stream",
-      { options: { signal: AbortSignal.timeout(20000) } },
-      {
-        logger,
-        reuploadRequest:
-          this.socket?.updateMediaMessage ??
-          (async () => {
-            throw new Error("Offline");
-          }),
-      },
-    );
+    const download = (message: WAMessage) =>
+      downloadMediaMessage(message, "stream", {
+        options: { signal: AbortSignal.timeout(20000) },
+      });
+    const stream = await download(message).catch(async (error: unknown) => {
+      if (!this.socket || ![403, 404, 410].includes(httpStatus(error) ?? 0))
+        throw error;
+      // rc14 throws Boom errors here but its retry path checks error.status.
+      let refreshed: WAMessage;
+      try {
+        refreshed = await this.socket.updateMediaMessage(message);
+      } catch (error) {
+        if (httpStatus(error) === 404)
+          throw new BridgeError(
+            "media_unavailable",
+            "WhatsApp could not provide this attachment. Its message and metadata remain available, but file bytes were not retrieved.",
+          );
+        throw error;
+      }
+      return download(refreshed);
+    });
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of stream) {
@@ -760,6 +806,7 @@ export class WhatsApp implements Sender {
     return result.key.id;
   }
   stop() {
+    this.history.close();
     this.stopping = true;
     this.connected = false;
     this.socket?.end(undefined);

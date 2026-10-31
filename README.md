@@ -199,6 +199,64 @@ not just a prompt instruction, to enforce review. Accepted means provider
 acceptance, not delivery. An uncertain or accepted draft is never automatically
 resent; inspect WhatsApp before making a replacement draft.
 
+## Load older conversations
+
+Ask your agent to "load the September conversation in this chat" or "search older
+messages for the DNS change". The service stores retrieved history so every connected
+agent can reuse it.
+
+1. Call `sync_history` with `chat_id`, optional `sent_at` date range, and a batch
+   budget `max_batches` from 1 to 10, default 3.
+2. Poll `get_history_status` using the returned `id` as `job_id`.
+3. Call `read_messages` or `search_messages` locally with the desired filters.
+   Start a fresh query without a previous page cursor to include arriving messages.
+
+Reads and searches never initiate network fetching. Their `chat_coverage` includes
+stored date bounds and count for each requested chat, including when a search finds
+nothing. Bounds do not prove every message between those dates is present.
+
+Without a date range, sync starts at the oldest usable stored raw message. For a
+range, it starts at the nearest usable message at or after `to`, falling back to
+the newest available message if necessary. It never treats an unrelated earlier
+stored message as evidence that the requested period was fetched. You can supply
+`before_message_id` to choose a specific starting anchor.
+
+Each batch requests 50 messages. A completed response supplies the next anchor,
+even if those messages were already stored. `traversed_from` and `traversed_to`
+show the actual dates walked by completed responses. They may differ from the
+requested dates and still do not establish gap-free coverage. `next_message_id`
+is the last confirmed cursor, usable as `before_message_id` on a later request.
+
+Jobs match responses by request ID. A matching chunk with `progress: 100` confirms
+completion; neither a first chunk nor a fixed pause does. Each batch has a 30-second
+deadline covering dispatch and response. If data arrives without confirmation, the
+job ends `response_incomplete`; the messages remain available to local queries.
+Uncorrelated chunks are stored normally but cannot complete or advance a job.
+
+Other terminal outcomes are `target_reached`, `batch_limit`, `no_progress`,
+`timed_out`, `no_anchor`, `offline`, `failed`, and `interrupted`. None proves that
+WhatsApp has no older messages. `messages_added` counts new messages in matching
+responses, excluding duplicates and unrelated live traffic.
+
+Requests are serialized. Matching requests for one chat share an active job;
+a different scope returns `busy` with the existing job ID. Jobs survive client
+disconnects; a service restart marks unfinished jobs `interrupted` without retrying
+them. The phone must be able to respond. Chats with no usable stored raw message
+need initial history or a new message before they can fetch earlier messages.
+
+New pairings request `syncFullHistory: true` using Baileys' default Chrome
+profile. Existing pairings keep their saved sync preference. Set
+`WHATSAPP_HISTORY_MODE=recent` for lighter initial sync, or `full` to request
+broader history. Pairing also enables history shared with you when you joined a
+group. Both modes keep the same browser identity. WhatsApp decides how
+much history it shares; full mode does not guarantee every older message.
+`get_status.history_sync` reports the configured mode and last history event or phase. Scrolling a separate WhatsApp Web session does not populate
+this service. Disappearing, deleted, expired, and view-once content still follows
+the existing retention rules. A recovered attachment message does not guarantee
+that WhatsApp still has its file bytes. The service asks the phone to refresh
+expired media references; if the phone cannot provide the file, the message and
+metadata remain readable.
+
 ## Data and operation
 
 - Messages and attachment bytes are stored locally in `.data/bridge.sqlite`.
@@ -225,6 +283,7 @@ resent; inspect WhatsApp before making a replacement draft.
 |---|---|---|
 | `BRIDGE_DATA_DIR` | `.data` relative to the working directory | Service and owner commands |
 | `BRIDGE_PORT` | `3210` | Service and owner commands |
+| `WHATSAPP_HISTORY_MODE` | `full` for new pairings; saved preference for existing pairings | Service |
 | `WHATSAPP_BRIDGE_TOKEN` | Required | Stdio adapter |
 | `WHATSAPP_BRIDGE_URL` | `http://127.0.0.1:3210/mcp` | Stdio adapter |
 

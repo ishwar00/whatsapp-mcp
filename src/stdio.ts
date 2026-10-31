@@ -13,6 +13,7 @@ import { pathToFileURL } from "node:url";
 
 const readTools = new Set([
   "get_status",
+  "get_history_status",
   "list_chats",
   "list_participants",
   "read_messages",
