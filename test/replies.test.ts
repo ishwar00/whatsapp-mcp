@@ -777,6 +777,8 @@ test("default quiet window catches a fresh reply without walking a thousand lega
     f.store.removeMessageEvent(f.original.id);
     for (let i = 0; i < 1000; i++)
       f.ingest("old chatter", { at: f.now() - 86400000 + i * 1000 });
+    // Ingestion records wall time; keep the simulated clock ahead of it.
+    f.advance(60000);
     const original = f.ingest("please update records", { outgoing: true });
     const w = await f.create({ message_ids: [original.id] });
     f.advance();
