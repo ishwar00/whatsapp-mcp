@@ -48,8 +48,20 @@ not only an interactive terminal.
 ## Connect notification delivery
 
 Push delivery requires Postbag with `service-grant`, `service-check` and
-`service-send --json` support. Run these commands from the **receiving agent's
-session**; an agent can do this setup itself:
+`service-send --json` support. Until that extension is released upstream, install
+the reviewed build in a separate tool environment:
+
+```sh
+uv tool install --from git+https://github.com/ishwar00/postbag.git@ac98e12 postbag
+```
+
+If you already use another Postbag version, keep it installed and use a dedicated
+virtual environment for this build instead. Point `postbag_executable` at the new
+executable. Existing peer sessions can keep their old Postbag version because the
+service grants use a separate sidecar.
+
+Run these commands from the **receiving agent's session**; an agent can do this
+setup itself:
 
 ```sh
 postbag --bag client-work join codex my-agent
