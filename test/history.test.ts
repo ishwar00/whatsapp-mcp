@@ -452,6 +452,27 @@ test("MCP reads/searches stay local, coverage is included, explicit sync reports
   }
 });
 
+test("the legacy saved desktop preference upgrades to full history", () => {
+  const f = fixture();
+  try {
+    f.store.put("setting", "history-mode", "desktop");
+    const saved = f.store.get("setting", "history-mode");
+    assert.equal(resolveHistoryMode({ saved, paired: true }), "full");
+    assert.equal(resolveHistoryMode({ saved, paired: false }), "full");
+    assert.equal(
+      resolveHistoryMode({ override: "recent", saved, paired: true }),
+      "recent",
+    );
+    for (const override of ["desktop", "typo", ""])
+      assert.throws(() =>
+        resolveHistoryMode({ override, saved, paired: true }),
+      );
+    assert.throws(() => resolveHistoryMode({ saved: "typo", paired: true }));
+  } finally {
+    f.close();
+  }
+});
+
 test("full initial sync preserves existing sync preferences", () => {
   assert.equal(resolveHistoryMode({ saved: undefined, paired: false }), "full");
   assert.equal(

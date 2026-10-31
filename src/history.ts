@@ -8,11 +8,10 @@ export function resolveHistoryMode(options: {
   saved: unknown;
   paired: boolean;
 }) {
+  const saved = options.saved === "desktop" ? "full" : options.saved;
   return z
     .enum(["full", "recent"])
-    .parse(
-      options.override ?? options.saved ?? (options.paired ? "recent" : "full"),
-    );
+    .parse(options.override ?? saved ?? (options.paired ? "recent" : "full"));
 }
 
 export const historyInput = z
