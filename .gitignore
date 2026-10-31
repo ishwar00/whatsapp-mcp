@@ -12,6 +12,7 @@ scripts/*
 !scripts/patch-baileys.mjs
 docs/*
 !docs/mcp-contract.md
+!docs/replies.md
 .DS_Store
 !docs/design.md
 !docs/implementation-plan.md

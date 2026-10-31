@@ -257,6 +257,14 @@ that WhatsApp still has its file bytes. The service asks the phone to refresh
 expired media references; if the phone cannot provide the file, the message and
 metadata remain readable.
 
+## Reply notifications
+
+Reply subscriptions can notify an agent about quoted and unquoted responses to
+its messages. A configurable temporary Claude Code or Codex execution filters
+group chatter; Postbag delivers pointer notices to the original agent. Every
+subscription has a hard deadline and preserves catch-up state. See
+[Reply subscriptions](docs/replies.md) for setup, tools, context and timeout behavior.
+
 ## Data and operation
 
 - Messages and attachment bytes are stored locally in `.data/bridge.sqlite`.

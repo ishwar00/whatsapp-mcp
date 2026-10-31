@@ -6,10 +6,29 @@ import lockfile from "proper-lockfile";
 import { z } from "zod";
 import QRCode from "qrcode";
 import { setTimeout as delay } from "node:timers/promises";
+import { replySettingsSchema } from "./replies.js";
 process.umask(0o077);
 const dir = resolve(process.env.BRIDGE_DATA_DIR || ".data");
 const command = process.argv[2];
-if (command === "init") {
+if (command === "reply-config") {
+  const path = process.argv[3];
+  if (!path)
+    throw new Error(
+      "Usage: npm run owner -- reply-config /absolute/settings.json",
+    );
+  const settings = replySettingsSchema.parse(
+    JSON.parse(readFileSync(path, "utf8")),
+  );
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(dir, "reply-settings.json"),
+    JSON.stringify(settings, null, 2) + "\n",
+    { mode: 0o600 },
+  );
+  process.stdout.write(
+    "Reply settings saved. Restart the service to apply them.\n",
+  );
+} else if (command === "init") {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, "owner-key");
   if (!existsSync(path))

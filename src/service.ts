@@ -8,6 +8,7 @@ import {
   type Principal,
 } from "./domain.js";
 import { Store, hash } from "./store.js";
+import type { ReplyWatches } from "./replies.js";
 export interface Sender {
   connected: boolean;
   ownerIds: string[];
@@ -23,6 +24,7 @@ export class Service {
   constructor(
     public store: Store,
     public sender: Sender,
+    public replies?: ReplyWatches,
   ) {}
   coverage() {
     return {
@@ -263,7 +265,11 @@ export class Service {
     );
     if (actual !== draft.digest) throw new BridgeError("request_conflict");
     if (!this.sender.connected) throw new BridgeError("service_offline");
-    draft = { ...draft, status: "attempting" };
+    draft = {
+      ...draft,
+      status: "attempting",
+      attemptedAt: new Date().toISOString(),
+    };
     this.store.saveDraft(draft);
     try {
       const providerId = await this.sender.send(draft);
