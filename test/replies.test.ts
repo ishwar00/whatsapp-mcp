@@ -237,7 +237,7 @@ test("quoted replies skip the classifier, duplicates don't notify, and edits/del
   }
 });
 
-test("uncertainty is reconsidered once then surfaced; invalid classifier output is explicit unclassified data", async () => {
+test("uncertainty surfaces immediately; invalid classifier output is explicit unclassified data", async () => {
   let calls = 0;
   const f = fixture(async (c) => ({
     results: c.candidates.map((m) => ({
@@ -252,7 +252,7 @@ test("uncertainty is reconsidered once then surfaced; invalid classifier output 
     f.advance();
     f.ingest("maybe");
     await f.replies.tick();
-    assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 0);
+    assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 1);
     await f.replies.tick();
     assert.equal(
       f.replies.read(f.p, { watch_id: w.id }).replies[0]?.label,
@@ -383,36 +383,28 @@ test("revoked keys, wrong principals, expired preparation and old backfill are h
   }
 });
 
-test("a reconsidered uncertain reply gets a new event beyond an already-read cursor", async () => {
+test("uncertain replies surface immediately as possible without rechecks or extra calls", async () => {
   const f = fixture(async (c) => ({
     results: c.candidates.map((m) => ({
       message_id: m.id,
       revision: m.revision,
-      label: m.text === "maybe" ? "uncertain" : "relevant",
-      reason: "Synthetic judgement",
+      label: "uncertain",
+      reason: "ambiguous acknowledgment",
     })),
   }));
   try {
     const w = await f.create();
     f.advance();
-    const uncertain = f.ingest("maybe");
-    f.ingest("done with records");
+    f.ingest("maybe");
     await f.replies.tick();
     const first = f.replies.read(f.p, { watch_id: w.id });
-    assert.equal(first.replies.length, 1);
+    assert.equal(first.replies[0]?.label, "possible");
     await f.replies.tick();
-    const second = f.replies.read(f.p, {
-      watch_id: w.id,
-      after: first.next_cursor,
-    });
-    assert.equal(second.replies.length, 1);
-    assert.equal(second.replies[0]?.message?.id, uncertain.id);
-    assert.equal(second.replies[0]?.label, "possible");
-    assert.ok(second.next_cursor > first.next_cursor);
+    assert.equal(f.contexts.length, 1);
     assert.equal(
-      f.contexts.length,
-      1,
-      "unchanged context must not launch the classifier twice",
+      f.replies.read(f.p, { watch_id: w.id, after: first.next_cursor }).replies
+        .length,
+      0,
     );
   } finally {
     await f.close();
@@ -499,16 +491,14 @@ test("same-second replies survive millisecond send time and a late subscription 
     await f.replies.tick();
     assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 1);
     f.advance(6000);
-    const late = await f.create({
-      message_ids: undefined,
-      draft_ids: [d.id],
-      timeout_seconds: 5,
-    });
-    assert.equal(
-      f.replies.read(f.p, { watch_id: late.id }).watch.state,
-      "expired",
+    await assert.rejects(
+      f.create({
+        message_ids: undefined,
+        draft_ids: [d.id],
+        timeout_seconds: 5,
+      }),
+      /deadline already passed/,
     );
-    assert.equal(Date.parse(late.expires_at), sentAt + 5000);
   } finally {
     await f.close();
   }
@@ -776,6 +766,245 @@ test("concurrent notification preflights preserve request idempotency", async ()
     ]);
     assert.equal(other.filter((r) => r.status === "fulfilled").length, 1);
     assert.equal(other.filter((r) => r.status === "rejected").length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("default quiet window catches a fresh reply without walking a thousand legacy messages", async () => {
+  const f = fixture(undefined, { quiet_seconds: 5 });
+  try {
+    f.store.removeMessageEvent(f.original.id);
+    for (let i = 0; i < 1000; i++)
+      f.ingest("old chatter", { at: f.now() - 86400000 + i * 1000 });
+    const original = f.ingest("please update records", { outgoing: true });
+    const w = await f.create({ message_ids: [original.id] });
+    f.advance();
+    f.ingest("both records done");
+    let ticks = 0;
+    for (; ticks < 7 && !f.contexts.length; ticks++) {
+      await f.replies.tick();
+      f.advance();
+    }
+    assert.equal(f.contexts.length, 1);
+    assert.ok(ticks <= 6);
+    assert.equal(f.replies.read(f.p, { watch_id: w.id }).replies.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("default quiet window never delays pages containing no eligible candidates", async () => {
+  const f = fixture(undefined, { quiet_seconds: 5 });
+  try {
+    const w = await f.create();
+    const before = f.replies.read(f.p, { watch_id: w.id }).watch.cursor_rev;
+    for (let i = 0; i < 110; i++)
+      f.ingest("old backfill", { at: f.now() - 86400000, history: true });
+    await f.replies.tick();
+    assert.ok(
+      f.replies.read(f.p, { watch_id: w.id }).watch.cursor_rev > before,
+    );
+    assert.equal(f.contexts.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("expired anchors are rejected rather than forwarding old group chatter as unclassified", async () => {
+  const f = fixture(undefined, { quiet_seconds: 5 });
+  try {
+    const old = f.ingest("old request", {
+      outgoing: true,
+      at: f.now() - 7200000,
+    });
+    for (let i = 0; i < 50; i++)
+      f.ingest("unrelated chatter", { at: f.now() - 600000 + i * 1000 });
+    await assert.rejects(
+      f.create({ message_ids: [old.id], timeout_seconds: 1800 }),
+      /deadline already passed/,
+    );
+    assert.equal(f.store.all("reply-watch").length, 0);
+    assert.equal(f.contexts.length, 0);
+    assert.equal(f.notices.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("chronological context includes interleaved owner followups, filtered senders and recently edited old messages", async () => {
+  const f = fixture(undefined, { quiet_seconds: 5 });
+  try {
+    f.advance();
+    const first = f.ingest("record one done");
+    f.advance();
+    const owner = f.ingest("also check the second record", { outgoing: true });
+    f.advance();
+    const other = f.ingest("that is a different topic");
+    f.store.saveMessage({ ...other, senderId: "other" });
+    f.advance();
+    f.ingest("record two done");
+    f.store.saveMessage({
+      ...f.store.message(owner.id),
+      text: "also check record two, edited",
+      editedAt: new Date(f.now()).toISOString(),
+    });
+    await f.create({ from_participant_ids: [first.senderId] });
+    for (let i = 0; i < 7 && !f.contexts.length; i++) {
+      await f.replies.tick();
+      f.advance();
+    }
+    assert.ok(f.contexts[0]?.recent_messages.some((m) => m.id === owner.id));
+    assert.ok(f.contexts[0]?.recent_messages.some((m) => m.id === other.id));
+    assert.ok(!f.contexts[0]?.candidates.some((m) => m.id === other.id));
+  } finally {
+    await f.close();
+  }
+});
+
+test("a quoted reply remains exact when the deadline aborts a neighboring model batch", async () => {
+  let began = () => {};
+  const started = new Promise<void>((resolve) => {
+    began = resolve;
+  });
+  const f = fixture(
+    async (_c, signal) => {
+      began();
+      await new Promise<void>((_r, reject) =>
+        signal.addEventListener("abort", () => reject(new Error("abort")), {
+          once: true,
+        }),
+      );
+      return { results: [] };
+    },
+    { quiet_seconds: 5 },
+  );
+  try {
+    const w = await f.create({ timeout_seconds: 12 });
+    f.advance();
+    const quote = f.ingest("yes", { reply: f.original.providerId });
+    f.ingest("unquoted records reply");
+    await f.replies.tick();
+    f.advance(5000);
+    const running = f.replies.tick();
+    await started;
+    f.advance(7000);
+    await f.replies.tick();
+    await running;
+    const r = f.replies.read(f.p, { watch_id: w.id });
+    assert.equal(
+      r.replies.find((x) => x.message?.id === quote.id)?.label,
+      "relevant",
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("an older concurrent preflight cannot overwrite a newer grant, including a shorter new lifetime", async () => {
+  const f = fixture();
+  let replies: ReplyWatches | undefined;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  try {
+    const r = (replies = new ReplyWatches(
+      f.store,
+      {},
+      {
+        now: f.now,
+        notifier: {
+          check: async (d) => {
+            if (d.service_token === "synthetic-older-token-value") await held;
+            return {
+              expires_at: new Date(
+                f.now() + (d.service_token.includes("older") ? 3600000 : 60000),
+              ).toISOString(),
+            };
+          },
+          send: async () => "submitted",
+        },
+      },
+    ));
+    const scope = (id: string, token: string) => ({
+      request_id: id,
+      message_ids: [f.original.id],
+      waiting_for: "records",
+      notify: { bag: "test", peer: "agent", service_token: token },
+    });
+    const older = r.create(f.p, scope("older", "synthetic-older-token-value"));
+    await r.create(f.p, scope("newer", "synthetic-newer-token-value"));
+    release();
+    await assert.rejects(older, /credentials changed/);
+    const stored = f.store.all("reply-destination");
+    assert.equal(stored.length, 1);
+    assert.equal(
+      JSON.stringify(stored).includes("synthetic-newer-token-value"),
+      true,
+    );
+  } finally {
+    release();
+    await replies?.close();
+    await f.close();
+  }
+});
+
+test("deleting a relevant message retains its tombstone without another push", async () => {
+  const f = fixture();
+  try {
+    const w = await f.create();
+    f.advance();
+    const m = f.ingest("done with records");
+    await f.replies.tick();
+    await f.replies.tick();
+    assert.equal(f.notices.length, 1);
+    const before = f.replies.read(f.p, { watch_id: w.id }).next_cursor;
+    f.store.eraseMessage(m.id);
+    await f.replies.tick();
+    await f.replies.tick();
+    assert.equal(f.notices.length, 1);
+    assert.equal(
+      f.replies.read(f.p, { watch_id: w.id, after: before }).replies[0]?.message
+        ?.deleted,
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("deployed prototype decisions upgrade without losing event IDs or deletion erasure", async () => {
+  const f = fixture();
+  try {
+    const w = await f.create();
+    f.advance();
+    const m = f.ingest("done with records");
+    await f.replies.tick();
+    const before = f.replies.read(f.p, { watch_id: w.id });
+    await f.replies.close();
+    f.store.db.exec(
+      "ALTER TABLE reply_decisions ADD COLUMN checked_count INTEGER NOT NULL DEFAULT 1; UPDATE reply_decisions SET label='uncertain';",
+    );
+    await f.restart();
+    const after = f.replies.read(f.p, { watch_id: w.id });
+    assert.equal(after.replies[0]?.event_id, before.replies[0]?.event_id);
+    assert.equal(after.replies[0]?.label, "possible");
+    assert.equal(
+      f.store.db
+        .prepare(
+          "SELECT count(*) n FROM pragma_table_info('reply_decisions') WHERE name='checked_count'",
+        )
+        .get()?.n,
+      0,
+    );
+    f.store.eraseMessage(m.id);
+    assert.equal(
+      f.store.db
+        .prepare("SELECT reason FROM reply_decisions WHERE watch=?")
+        .get(w.id)?.reason,
+      "Message deleted",
+    );
   } finally {
     await f.close();
   }

@@ -103,7 +103,8 @@ inserted into a user-role notification. The agent retrieves actual content throu
 3. The service includes replies already stored after the send, so an immediate
    response arriving before subscription creation is still found. The deadline is
    the earliest watched send time plus the timeout; registering late cannot extend
-   it. A watch registered after its deadline reports expiry.
+   it. Registration is rejected once the deadline has passed; choose a larger timeout
+   if the intended wait should still be active.
 4. On a notice, call `get_replies({watch_id})`. Save `next_cursor` and pass it as
    `after` for later reads. There is no separate acknowledgment call. Notices carry
    stable IDs and revisions; duplicate pointers are safe to ignore.
@@ -133,11 +134,12 @@ Batches are packed to the context limit. An individually oversized message is
 retained as unclassified while fitting neighboring messages are still classified.
 Quoted replies to selected messages bypass semantic classification.
 
-Labels are `relevant`, `unrelated` or `uncertain`. The service reconsiders uncertain
-candidates with new context once; without new context it surfaces them as possible
-after the quiet period without repeating the same model call. Relevant/possible
-events produce coalesced pointer notices. `include_unrelated` allows audit reads.
-Edits create new decision events; current content and deletion rules always apply.
+The model returns `relevant`, `unrelated` or `uncertain`. Uncertain results surface
+immediately as `possible`, with the model's reason. There is no deferred recheck
+queue or repeated classification of unchanged content. Relevant/possible events
+produce coalesced pointer notices. `include_unrelated` allows audit reads.
+Edits create new decision events; deletions remain readable as tombstones without
+sending another reply notification.
 
 Classifier failure or call-budget exhaustion produces one warning per watch,
 not a notification for every subsequent group message. Unclassified candidates

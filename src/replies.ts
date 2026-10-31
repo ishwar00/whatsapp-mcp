@@ -76,15 +76,8 @@ const decisionSchema = z.object({
   provider_id: z.string(),
   rev: z.number(),
   fingerprint: z.string(),
-  label: z.enum([
-    "relevant",
-    "unrelated",
-    "uncertain",
-    "possible",
-    "unclassified",
-  ]),
+  label: z.enum(["relevant", "unrelated", "possible", "unclassified"]),
   reason: z.string(),
-  checked_count: z.number(),
 });
 type Decision = z.infer<typeof decisionSchema>;
 const noticeSchema = z.object({
@@ -143,11 +136,21 @@ export class ReplyWatches {
           throw new Error("Classifier is not configured");
         return classifyReplies(this.settings.classifier, context, signal);
       });
-    store.db.exec(`CREATE TABLE IF NOT EXISTS reply_decisions(
+    store.transaction(() => {
+      const legacy = store.db
+        .prepare(
+          "SELECT 1 FROM pragma_table_info('reply_decisions') WHERE name='checked_count'",
+        )
+        .get();
+      if (legacy)
+        store.db.exec(
+          "DROP TRIGGER IF EXISTS reply_reasons_erased; DROP INDEX IF EXISTS reply_decisions_watch; ALTER TABLE reply_decisions RENAME TO reply_decisions_legacy;",
+        );
+      store.db.exec(`CREATE TABLE IF NOT EXISTS reply_decisions(
       id INTEGER PRIMARY KEY AUTOINCREMENT, watch TEXT NOT NULL, message_id TEXT NOT NULL,
       provider_id TEXT NOT NULL, rev INTEGER NOT NULL, fingerprint TEXT NOT NULL,
-      label TEXT NOT NULL, reason TEXT NOT NULL, checked_count INTEGER NOT NULL,
-      UNIQUE(watch,provider_id,rev,checked_count));
+      label TEXT NOT NULL, reason TEXT NOT NULL,
+      UNIQUE(watch,provider_id,rev));
       CREATE INDEX IF NOT EXISTS reply_decisions_watch ON reply_decisions(watch,id);
       CREATE TABLE IF NOT EXISTS reply_notices(
       id INTEGER PRIMARY KEY AUTOINCREMENT, watch TEXT NOT NULL,kind TEXT NOT NULL,upto INTEGER NOT NULL,
@@ -160,8 +163,16 @@ export class ReplyWatches {
       UPDATE reply_notices SET state='pending' WHERE state IN ('attempting','sending','unknown','unavailable');
       UPDATE reply_notices SET state='sent' WHERE state IN ('submitted','acknowledged');
       UPDATE reply_notices SET state='failed' WHERE state IN ('superseded','exhausted');`);
+      if (legacy)
+        store.db
+          .exec(`INSERT INTO reply_decisions(id,watch,message_id,provider_id,rev,fingerprint,label,reason)
+        SELECT id,watch,message_id,provider_id,rev,fingerprint,CASE label WHEN 'uncertain' THEN 'possible' ELSE label END,reason
+        FROM reply_decisions_legacy d WHERE id=(SELECT max(x.id) FROM reply_decisions_legacy x WHERE x.watch=d.watch AND x.provider_id=d.provider_id AND x.rev=d.rev);
+        DROP TABLE reply_decisions_legacy;`);
+    });
     this.upgradeWatches();
   }
+  // Earlier commits of this unmerged feature were deployed to the local daemon.
   private upgradeWatches() {
     for (const raw of this.store.all("reply-watch")) {
       const old = z
@@ -307,11 +318,10 @@ export class ReplyWatches {
     m: Versioned,
     label: Decision["label"],
     reason: string,
-    checked = 1,
   ) {
     this.store.db
       .prepare(
-        "INSERT OR IGNORE INTO reply_decisions(watch,message_id,provider_id,rev,fingerprint,label,reason,checked_count) VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO reply_decisions(watch,message_id,provider_id,rev,fingerprint,label,reason) VALUES(?,?,?,?,?,?,?)",
       )
       .run(
         watch.id,
@@ -321,7 +331,6 @@ export class ReplyWatches {
         semanticFingerprint(m.message),
         label,
         reason,
-        checked,
       );
   }
   private notice(watch: Watch, kind: string) {
@@ -448,8 +457,15 @@ export class ReplyWatches {
         ...drafts.map((d) => Date.parse(d.attemptedAt ?? d.createdAt)),
       );
     }
+    if (!existing && start + q.timeout_seconds * 1000 <= this.now())
+      throw new BridgeError(
+        "invalid_argument",
+        "Subscription deadline already passed; choose a larger timeout",
+      );
     let destinationId: string | null = null;
     if (q.notify) {
+      const id = this.destinationId(p.id, q.notify);
+      const previousToken = this.store.get("reply-destination", id);
       let expires_at: string | null;
       try {
         expires_at =
@@ -469,7 +485,17 @@ export class ReplyWatches {
       );
       if (existing && existing.fingerprint !== fingerprint)
         throw new BridgeError("request_conflict");
-      destinationId = this.destinationId(p.id, q.notify);
+      const currentToken = this.store.get("reply-destination", id);
+      if (
+        hash(currentToken ?? null) !== hash(previousToken ?? null) &&
+        destinationSchema.parse(currentToken).service_token !==
+          q.notify.service_token
+      )
+        throw new BridgeError(
+          "request_conflict",
+          "Notification credentials changed during validation; retry with the current grant",
+        );
+      destinationId = id;
       this.store.transaction(() => {
         this.store.put("reply-destination", destinationId!, {
           ...q.notify,
@@ -505,7 +531,18 @@ export class ReplyWatches {
       created_at: new Date(this.now()).toISOString(),
       started_at: new Date(start).toISOString(),
       expires_at: new Date(start + q.timeout_seconds * 1000).toISOString(),
-      cursor_rev: -1,
+      cursor_rev: z
+        .object({ value: z.number() })
+        .parse(
+          this.store.db
+            .prepare(
+              "SELECT coalesce(min(rev)-1,-1) value FROM messages INDEXED BY messages_chat_time WHERE chat=? AND coalesce(sent,observed)>=?",
+            )
+            .get(
+              this.store.chatId(chat),
+              new Date(Math.floor(start / 1000) * 1000).toISOString(),
+            ),
+        ).value,
       calls_used: 0,
       pending_since: null,
       error: null,
@@ -589,11 +626,18 @@ export class ReplyWatches {
     }
     const recent = this.store.db
       .prepare(
-        "SELECT value,rev FROM messages WHERE chat=? AND rev<? AND json_extract(value,'$.deleted')=0 ORDER BY coalesce(sent,observed) DESC,id DESC LIMIT 20",
+        "SELECT value,rev FROM messages WHERE chat=? AND coalesce(sent,observed)<=? AND id NOT IN (SELECT value FROM json_each(?)) AND json_extract(value,'$.deleted')=0 ORDER BY coalesce(sent,observed) DESC,id DESC LIMIT 20",
       )
       .all(
         this.store.chatId(watch.chat_id),
-        Math.min(...candidates.map((v) => v.rev)),
+        new Date(
+          Math.max(
+            ...candidates.map((v) =>
+              Date.parse(v.message.sentAt ?? v.message.observedAt),
+            ),
+          ),
+        ).toISOString(),
+        JSON.stringify([...candidateIds]),
       )
       .map((row) => {
         const r = z.object({ value: z.string(), rev: z.number() }).parse(row);
@@ -635,14 +679,6 @@ export class ReplyWatches {
       this.controllers.get(watch.id)?.abort();
       this.store.transaction(() => {
         watch.state = principal ? "expired" : "cancelled";
-        const uncertain = this.decisions(watch.id).filter(
-          (d) => d.label === "uncertain",
-        );
-        for (const d of uncertain) {
-          const v = this.version(d.message_id);
-          if (v)
-            this.decide(watch, v, "possible", d.reason, d.checked_count + 1);
-        }
         if (principal) {
           const rows = this.store.db
             .prepare(
@@ -671,13 +707,19 @@ export class ReplyWatches {
               continue;
             const prior = this.lastDecision(watch.id, m.providerId);
             if (prior?.fingerprint === semanticFingerprint(m)) continue;
-            watch.error ??=
-              "Subscription deadline reached with unclassified candidates";
+            const quoted =
+              m.replyId &&
+              this.originalIds(watch).includes(
+                this.store.resolveId("message-alias", m.replyId),
+              );
+            if (!quoted)
+              watch.error ??=
+                "Subscription deadline reached with unclassified candidates";
             this.decide(
               watch,
               { message: m, rev: r.rev },
-              "unclassified",
-              watch.error,
+              quoted ? "relevant" : "unclassified",
+              quoted ? "Explicit quoted reply" : watch.error!,
             );
           }
         }
@@ -774,18 +816,16 @@ export class ReplyWatches {
               this.store.equivalents(id).has(m.senderId),
             )),
       );
-      const pending = this.decisions(watch.id)
-        .filter((d) => d.label === "uncertain")
-        .flatMap((d) => {
-          const v = this.version(d.message_id);
-          return v &&
-            !candidates.some(
-              (m) => m.message.providerId === v.message.providerId,
-            )
-            ? [v]
-            : [];
-        });
-      if (!versions.length && !pending.length) continue;
+      if (!versions.length) continue;
+      if (!candidates.length) {
+        watch.cursor_rev = Math.max(
+          watch.cursor_rev,
+          ...versions.map((v) => v.rev),
+        );
+        watch.pending_since = null;
+        this.save(watch);
+        continue;
+      }
       const first = watch.pending_since ?? this.now();
       if (watch.pending_since === null) {
         watch.pending_since = first;
@@ -811,26 +851,17 @@ export class ReplyWatches {
         v: Versioned;
         label: Decision["label"];
         reason: string;
-        checked: number;
       }[] = [];
-      const stage = (
-        v: Versioned,
-        label: Decision["label"],
-        reason: string,
-        checked = 1,
-      ) => staged.push({ v, label, reason, checked });
+      const stage = (v: Versioned, label: Decision["label"], reason: string) =>
+        staged.push({ v, label, reason });
       let warning = false;
-      for (const v of [...candidates, ...pending].slice(0, 20)) {
+      for (const v of candidates.slice(0, 20)) {
         const previous = this.lastDecision(watch.id, v.message.providerId);
         if (v.message.deleted) {
-          if (previous)
-            stage(v, previous.label, "Message deleted", previous.checked_count);
-        } else if (previous?.label === "uncertain" && versions.length === 0) {
-          stage(v, "possible", previous.reason, previous.checked_count + 1);
+          if (previous) stage(v, previous.label, "Message deleted");
         } else if (
           previous &&
-          previous.fingerprint === semanticFingerprint(v.message) &&
-          previous.label !== "uncertain"
+          previous.fingerprint === semanticFingerprint(v.message)
         ) {
           // Identity-only revisions do not create another decision.
         } else if (
@@ -891,29 +922,13 @@ export class ReplyWatches {
           error = null;
           for (const r of result.results) {
             const v = expected.get(r.message_id)!;
-            const previous = this.lastDecision(watch.id, v.message.providerId);
-            const checked =
-              (previous?.label === "uncertain" ? previous.checked_count : 0) +
-              1;
-            stage(
-              v,
-              r.label === "uncertain" && checked >= 2 ? "possible" : r.label,
-              r.reason,
-              checked,
-            );
+            stage(v, r.label === "uncertain" ? "possible" : r.label, r.reason);
           }
         } catch {
           error =
             "Classifier unavailable, timed out, exceeded budget, or returned invalid output";
           warning = true;
-          for (const v of batch)
-            stage(
-              v,
-              "unclassified",
-              error,
-              (this.lastDecision(watch.id, v.message.providerId)
-                ?.checked_count ?? 0) + 1,
-            );
+          for (const v of batch) stage(v, "unclassified", error);
         } finally {
           clearTimeout(timer);
           this.controllers.delete(watch.id);
@@ -929,13 +944,21 @@ export class ReplyWatches {
         const visible = () =>
           hash(
             this.decisions(watch.id)
-              .filter((d) => this.visible(d) && d.label !== "unclassified")
+              .filter(
+                (d) =>
+                  this.visible(d) &&
+                  d.label !== "unclassified" &&
+                  Boolean(
+                    this.store.findMessage(d.message_id) &&
+                    !this.store.findMessage(d.message_id)?.deleted,
+                  ),
+              )
               .map((d) => [d.id, d.label]),
           );
         const before = visible();
         for (const d of staged)
           if (this.version(d.v.message.id)?.rev === d.v.rev)
-            this.decide(watch, d.v, d.label, d.reason, d.checked);
+            this.decide(watch, d.v, d.label, d.reason);
         const omitted = candidates.find((v) => !handled.has(v.rev))?.rev;
         watch.cursor_rev = Math.max(
           watch.cursor_rev,
