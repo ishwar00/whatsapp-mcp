@@ -261,6 +261,9 @@ test("delivery retries at 5, 30, 120 seconds then becomes undeliverable and eras
       chat_id: f.chat.id,
       codex_thread_id: thread,
     });
+    f.store.db
+      .prepare("INSERT INTO watch_handled VALUES(?,?,?)")
+      .run(w.watch_id, "previously-delivered", new Date(f.now()).toISOString());
     f.message("a");
     await watches.tick();
     f.advance(10000);
@@ -281,6 +284,12 @@ test("delivery retries at 5, 30, 120 seconds then becomes undeliverable and eras
     const row = f.store.db
       .prepare("SELECT state,target FROM watches WHERE id=?")
       .get(w.watch_id)!;
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      0,
+    );
     assert.equal(row.state, "undeliverable");
     assert.equal(row.target, null);
   } finally {
@@ -311,6 +320,12 @@ test("active watch reloads after restart with intent retained; expiry clears sec
       JSON.parse(readFileSync(f.audit, "utf8")).waiting_for,
       "DNS records",
     );
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      1,
+    );
     const other = { ...f.p, id: "other" };
     f.store.put("client", "other", other);
     assert.throws(() => restarted!.unwatch(other, w.watch_id));
@@ -320,6 +335,12 @@ test("active watch reloads after restart with intent retained; expiry clears sec
       f.store.db.prepare("SELECT state FROM watches WHERE id=?").get(w.watch_id)
         ?.state,
       "expired",
+    );
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      0,
     );
     assert.equal(
       f.store.db
@@ -403,20 +424,30 @@ test("Codex delivery finds a fake executable on PATH and forwards thread/message
   }
 });
 
-test("batches over thirty retain same-second messages for the next notice", async () => {
+test("multi-page same-timestamp batches handle every message exactly once", async () => {
   const f = fixture();
   try {
-    f.watch();
-    for (let i = 0; i < 31; i++) f.message("m" + String(i).padStart(2, "0"));
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
+    const w = f.watch();
+    for (let i = 0; i < 65; i++) f.message("m" + String(i).padStart(2, "0"));
+    for (let i = 0; i < 3; i++) {
+      await f.tick();
+      f.advance(10000);
+      await f.tick();
+    }
+    assert.equal(f.notices.length, 3);
     assert.match(f.notices[0], /30 new/);
+    assert.match(f.notices[1], /30 new/);
+    assert.match(f.notices[2], /5 new/);
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      65,
+    );
     await f.tick();
     f.advance(10000);
     await f.tick();
-    assert.equal(f.notices.length, 2);
-    assert.match(f.notices[1], /1 new/);
+    assert.equal(f.notices.length, 3);
   } finally {
     await f.close();
   }
@@ -569,12 +600,18 @@ test("existing watch rows migrate intent and calls out of legacy storage atomica
       .run(JSON.stringify({ ...target, calls: 7 }), w.watch_id);
     f.store.put("watch-intent", w.watch_id, "legacy waiting intent");
     f.store.db.exec(
-      "ALTER TABLE watches DROP COLUMN waiting_for; ALTER TABLE watches DROP COLUMN calls",
+      "ALTER TABLE watches DROP COLUMN waiting_for; ALTER TABLE watches DROP COLUMN calls; ALTER TABLE watches ADD COLUMN last_notified_sent_at TEXT",
     );
     upgraded = new Watches(f.store, f.sender, f.config, { now: f.now });
     let row = f.store.db
       .prepare("SELECT waiting_for,calls,target FROM watches WHERE id=?")
       .get(w.watch_id)!;
+    assert.ok(
+      !f.store.db
+        .prepare("PRAGMA table_info(watches)")
+        .all()
+        .some((c) => c.name === "last_notified_sent_at"),
+    );
     assert.equal(row.waiting_for, "legacy waiting intent");
     assert.equal(row.calls, 7);
     assert.ok(!("calls" in JSON.parse(String(row.target))));
@@ -588,6 +625,205 @@ test("existing watch rows migrate intent and calls out of legacy storage atomica
     assert.equal(row.calls, 7);
   } finally {
     await upgraded?.close();
+    await f.close();
+  }
+});
+
+test("late arrivals sent before the last delivered reply still notify", async () => {
+  const f = fixture();
+  try {
+    const w = f.watch();
+    f.advance(5000);
+    f.message("newer", { sentAt: "2026-11-02T10:00:05.000Z" });
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    f.message("late", {
+      sentAt: "2026-11-02T10:00:02.000Z",
+      source: "history",
+    });
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 2);
+    assert.ok(f.notices[1].includes("2026-11-02T10:00:02.000Z"));
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      2,
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("clean database restart and edits after delivery do not repeat a notice", async () => {
+  const f = fixture();
+  let reopened: Store | undefined, restarted: Watches | undefined;
+  try {
+    const w = f.watch();
+    const m = f.message("reply");
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    await f.watches.close();
+    f.store.close();
+    reopened = new Store(f.dir);
+    restarted = new Watches(reopened, f.sender, f.config, {
+      now: f.now,
+      deliver: async (_, n) => {
+        f.notices.push(n);
+      },
+    });
+    await restarted.tick();
+    f.advance(10000);
+    await restarted.tick();
+    assert.equal(f.notices.length, 1);
+    reopened.saveMessage({
+      ...m,
+      text: "edited after restart",
+      editedAt: new Date(f.now()).toISOString(),
+    });
+    await restarted.tick();
+    f.advance(10000);
+    await restarted.tick();
+    assert.equal(f.notices.length, 1);
+    assert.equal(
+      reopened.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      1,
+    );
+  } finally {
+    await restarted?.close();
+    reopened?.close();
+    await f.close();
+  }
+});
+test("unrelated group replies are durably handled without another relevance call across ticks or restart", async () => {
+  const f = fixture(true);
+  let reopened: Store | undefined, restarted: Watches | undefined;
+  try {
+    const w = f.watch();
+    f.message("irrelevant");
+    f.script({ relevant_ids: [] });
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 0);
+    assert.equal(
+      f.store.db.prepare("SELECT calls FROM watches WHERE id=?").get(w.watch_id)
+        ?.calls,
+      1,
+    );
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(
+      f.store.db.prepare("SELECT calls FROM watches WHERE id=?").get(w.watch_id)
+        ?.calls,
+      1,
+    );
+    await f.watches.close();
+    f.store.close();
+    reopened = new Store(f.dir);
+    restarted = new Watches(reopened, f.sender, f.config, {
+      now: f.now,
+      deliver: async (_, n) => {
+        f.notices.push(n);
+      },
+    });
+    await restarted.tick();
+    f.advance(10000);
+    await restarted.tick();
+    assert.equal(
+      reopened.db
+        .prepare("SELECT calls FROM watches WHERE id=?")
+        .get(w.watch_id)?.calls,
+      1,
+    );
+    assert.equal(f.notices.length, 0);
+  } finally {
+    await restarted?.close();
+    reopened?.close();
+    await f.close();
+  }
+});
+test("handled canonical identities survive duplicate message merging and watch end cleans handled rows", async () => {
+  const f = fixture();
+  try {
+    const lid = "777@lid",
+      pn = "555@s.whatsapp.net";
+    const old = f.store.saveChat(lid, "Person");
+    const oldId = f.store.messageId(lid, "same");
+    f.store.saveChat(pn, "Person");
+    const canonical = f.store.messageId(pn, "same");
+    f.message(oldId, { chatId: old.id, providerId: "same" });
+    f.message(canonical, {
+      chatId: f.store.saveChat(pn, "Person").id,
+      providerId: "same",
+    });
+    const w = f.watches.create(f.p, {
+      chat_id: old.id,
+      codex_thread_id: thread,
+    });
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    f.store.addAlias(lid, pn);
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    assert.equal(f.store.message(oldId).id, canonical);
+    f.watches.unwatch(f.p, w.watch_id);
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("failed delivery leaves relevant messages unhandled until a retry succeeds", async () => {
+  const f = fixture();
+  let attempts = 0;
+  const watches = new Watches(f.store, f.sender, f.config, {
+    now: f.now,
+    deliver: async () => {
+      if (++attempts === 1) throw Error("retry");
+    },
+  });
+  try {
+    const w = watches.create(f.p, {
+      chat_id: f.chat.id,
+      codex_thread_id: thread,
+    });
+    f.message("reply");
+    await watches.tick();
+    f.advance(10000);
+    await watches.tick();
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      0,
+    );
+    f.advance(5000);
+    await watches.tick();
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      1,
+    );
+  } finally {
+    await watches.close();
     await f.close();
   }
 });
