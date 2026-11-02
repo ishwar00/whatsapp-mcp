@@ -20,7 +20,7 @@ export function executable(name: string, configured?: string) {
   throw new Error(`${name} executable not found; configure its absolute path`);
 }
 
-export function subprocessEnvironment() {
+function subprocessEnvironment() {
   const env = { ...process.env };
   for (const key of Object.keys(env))
     if (
@@ -36,25 +36,17 @@ export function runProcess(
   command: string,
   args: string[],
   options: {
-    input?: string;
-    cwd?: string;
-    env?: NodeJS.ProcessEnv;
     signal: AbortSignal;
-    maxBytes?: number;
-    allowFailure?: boolean;
   },
-): Promise<string> {
+): Promise<void> {
   options.signal.throwIfAborted();
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
-      cwd: options.cwd,
-      env: options.env ?? subprocessEnvironment(),
-      stdio: ["pipe", "pipe", "pipe"],
+      env: subprocessEnvironment(),
+      stdio: "ignore",
       detached: process.platform !== "win32",
     });
-    const output: Buffer[] = [];
-    let size = 0,
-      failed: Error | undefined;
+    let failed: Error | undefined;
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const kill = (signal: NodeJS.Signals) => {
       try {
@@ -70,16 +62,6 @@ export function runProcess(
     };
     const abort = () => stop(new Error("Execution cancelled or timed out"));
     options.signal.addEventListener("abort", abort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) => {
-      size += chunk.length;
-      if (size > (options.maxBytes ?? 1_000_000))
-        stop(new Error("Execution output limit exceeded"));
-      else output.push(chunk);
-    });
-    // Never log CLI stderr: it can contain prompt content or inherited credentials.
-    child.stderr.resume();
-    child.stdin.on("error", () => {});
-    child.stdin.end(options.input ?? "");
     child.on("error", (error) => {
       failed = error;
     });
@@ -87,9 +69,9 @@ export function runProcess(
       options.signal.removeEventListener("abort", abort);
       if (killTimer) clearTimeout(killTimer);
       if (failed) reject(failed);
-      else if (code !== 0 && !options.allowFailure)
+      else if (code !== 0)
         reject(new Error(`Execution failed with exit code ${code}`));
-      else resolve(Buffer.concat(output).toString("utf8"));
+      else resolve();
     });
     if (options.signal.aborted) abort();
   });

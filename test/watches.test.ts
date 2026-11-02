@@ -6,7 +6,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store, hash } from "../src/store.js";
 import { Watches, deliver } from "../src/watches.js";
-import { classifierConfig } from "../src/reply-classifier.js";
 import { readInput } from "../src/mcp.js";
 import type { Message } from "../src/domain.js";
 const thread = "01234567-1234-4123-8123-123456789abc";
@@ -29,17 +28,7 @@ function fixture(group = false) {
   };
   store.put("client", p.id, p);
   const sender = { connected: true, ownerIds: ["me"], send: async () => "" };
-  const runner = join(dir, "runner.mjs"),
-    audit = join(dir, "audit.json");
-  const script = (output: unknown, fail = false) =>
-    writeFileSync(
-      runner,
-      `#!${process.execPath}\nimport{readFileSync,writeFileSync}from'node:fs';const data=JSON.parse(readFileSync(0,'utf8'));writeFileSync(${JSON.stringify(audit)},JSON.stringify(data));${fail ? "process.exit(1);" : `console.log(JSON.stringify({structured_output:${JSON.stringify(output)}}));`}`,
-      { mode: 0o700 },
-    );
-  script({ relevant_ids: [] });
-  const config = classifierConfig.parse({ executable: runner });
-  const watches = new Watches(store, sender, config, {
+  const watches = new Watches(store, sender, {
     now: () => now,
     deliver: async (_, notice) => {
       notices.push(notice);
@@ -74,7 +63,6 @@ function fixture(group = false) {
     watches.create(p, {
       chat_id: chat.id,
       codex_thread_id: thread,
-      ...(group ? { waiting_for: "DNS records" } : {}),
       ...extra,
     });
   return {
@@ -84,12 +72,9 @@ function fixture(group = false) {
     p,
     sender,
     watches,
-    config,
     notices,
     message,
     watch,
-    script,
-    audit,
     advance: (ms: number) => (now += ms),
     tick: () => watches.tick(),
     now: () => now,
@@ -135,17 +120,12 @@ test("watch catches pre-subscription replies, coalesces and emits only a schema-
     await f.close();
   }
 });
-test("watch requires a usable target, group intent, sender scope and enforces per-key limit", async () => {
+test("watch requires a usable target, named group sender and enforces per-key limit", async () => {
   const f = fixture(true);
   try {
     assert.throws(
-      () => f.watches.create(f.p, { chat_id: f.chat.id, waiting_for: "x" }),
+      () => f.watches.create(f.p, { chat_id: f.chat.id }),
       /pass codex_thread_id/,
-    );
-    assert.throws(
-      () =>
-        f.watches.create(f.p, { chat_id: f.chat.id, codex_thread_id: thread }),
-      /waiting_for/,
     );
     const w = f.watch({ from_participant_ids: ["allowed"] });
     f.message("ignored");
@@ -173,83 +153,10 @@ test("watch requires a usable target, group intent, sender scope and enforces pe
     await f.close();
   }
 });
-test("group relevance calls isolate a bounded batch, discard invented IDs, skip unrelated and fail toward waking", async () => {
-  const f = fixture(true);
-  try {
-    f.message("out", { direction: "outgoing", text: "add DNS records" });
-    const w = f.watch();
-    f.message("a", { text: "done" });
-    f.message("b", { text: "unrelated" });
-    f.script({ relevant_ids: ["a", "invented"] });
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(f.notices.length, 1);
-    assert.match(f.notices[0], /1 new/);
-    const input = JSON.parse(readFileSync(f.audit, "utf8"));
-    assert.equal(input.waiting_for, "DNS records");
-    assert.equal(input.outgoing, "add DNS records");
-    assert.equal(input.messages.length, 2);
-    f.advance(1000);
-    f.message("c");
-    f.script({ relevant_ids: [] });
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(f.notices.length, 1);
-    f.advance(1000);
-    f.message("d");
-    f.script(null, true);
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(f.notices.length, 2);
-    const row = f.store.db
-      .prepare("SELECT target,calls FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.equal(row.calls, 3);
-  } finally {
-    await f.close();
-  }
-});
-test("quoted outgoing replies, owner mentions and sender filter bypass group relevance; cap 50 fails toward waking", async () => {
-  const f = fixture(true);
-  try {
-    f.message("out", { direction: "outgoing" });
-    const w = f.watch();
-    f.message("quote", { replyId: "out" });
-    f.message("mention", { mentions: ["me"] });
-    f.script(null, true);
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(f.notices.length, 1);
-    assert.match(f.notices[0], /2 new/);
-    let row = f.store.db
-      .prepare("SELECT target,calls FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.equal(row.calls, 0);
-    f.store.db
-      .prepare("UPDATE watches SET calls=50 WHERE id=?")
-      .run(w.watch_id);
-    f.advance(1000);
-    f.message("budget");
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(f.notices.length, 2);
-    row = f.store.db
-      .prepare("SELECT target,calls FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.equal(row.calls, 50);
-  } finally {
-    await f.close();
-  }
-});
 test("delivery retries at 5, 30, 120 seconds then becomes undeliverable and erases target", async () => {
   const f = fixture();
   let calls = 0;
-  const watches = new Watches(f.store, f.sender, f.config, {
+  const watches = new Watches(f.store, f.sender, {
     now: f.now,
     deliver: async () => {
       calls++;
@@ -297,29 +204,27 @@ test("delivery retries at 5, 30, 120 seconds then becomes undeliverable and eras
     await f.close();
   }
 });
-test("active watch reloads after restart with intent retained; expiry clears secrets and other principals cannot cancel", async () => {
+test("active watch reloads after restart with sender routing retained; expiry clears secrets and other principals cannot cancel", async () => {
   const f = fixture(true);
   let restarted: Watches | undefined;
   try {
-    const w = f.watch({ timeout_seconds: 30 });
+    const w = f.watch({
+      timeout_seconds: 30,
+      from_participant_ids: ["person"],
+    });
     await f.watches.close();
-    restarted = new Watches(f.store, f.sender, f.config, {
+    restarted = new Watches(f.store, f.sender, {
       now: f.now,
       deliver: async (_, n) => {
         f.notices.push(n);
       },
     });
     assert.equal(restarted.status(f.p.id).length, 1);
-    f.script({ relevant_ids: ["a"] });
     f.message("a");
     await restarted.tick();
     f.advance(10000);
     await restarted.tick();
     assert.equal(f.notices.length, 1);
-    assert.equal(
-      JSON.parse(readFileSync(f.audit, "utf8")).waiting_for,
-      "DNS records",
-    );
     assert.equal(
       f.store.db
         .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
@@ -424,20 +329,16 @@ test("Codex delivery finds a fake executable on PATH and forwards thread/message
   }
 });
 
-test("multi-page same-timestamp batches handle every message exactly once", async () => {
+test("same-timestamp batches handle every message exactly once", async () => {
   const f = fixture();
   try {
     const w = f.watch();
     for (let i = 0; i < 65; i++) f.message("m" + String(i).padStart(2, "0"));
-    for (let i = 0; i < 3; i++) {
-      await f.tick();
-      f.advance(10000);
-      await f.tick();
-    }
-    assert.equal(f.notices.length, 3);
-    assert.match(f.notices[0], /30 new/);
-    assert.match(f.notices[1], /30 new/);
-    assert.match(f.notices[2], /5 new/);
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    assert.match(f.notices[0], /65 new/);
     assert.equal(
       f.store.db
         .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
@@ -447,7 +348,7 @@ test("multi-page same-timestamp batches handle every message exactly once", asyn
     await f.tick();
     f.advance(10000);
     await f.tick();
-    assert.equal(f.notices.length, 3);
+    assert.equal(f.notices.length, 1);
   } finally {
     await f.close();
   }
@@ -513,23 +414,6 @@ test("since offsets and omitted milliseconds normalize to the same UTC window an
     await f.close();
   }
 });
-test("intent and relevance budget live in watch columns, not targets or leaked objects", async () => {
-  const f = fixture(true);
-  try {
-    const w = f.watch();
-    const row = f.store.db
-      .prepare("SELECT waiting_for,calls,target FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.equal(row.waiting_for, "DNS records");
-    assert.equal(row.calls, 0);
-    assert.ok(!("calls" in JSON.parse(String(row.target))));
-    assert.equal(f.store.all("watch-intent").length, 0);
-    f.watches.unwatch(f.p, w.watch_id);
-    assert.equal(f.store.all("watch-intent").length, 0);
-  } finally {
-    await f.close();
-  }
-});
 test("non-delivery processing errors preserve active watch and retry next tick", async () => {
   const f = fixture();
   const chat = f.store.chat.bind(f.store);
@@ -582,7 +466,7 @@ test("unwatch preserves expired and undeliverable terminal states and stays idem
   }
 });
 
-test("existing watch rows migrate intent and calls out of legacy storage atomically and repeatably", async () => {
+test("existing watches retain routing and handled IDs while obsolete AI fields are removed", async () => {
   const f = fixture(true);
   let upgraded: Watches | undefined;
   try {
@@ -598,37 +482,60 @@ test("existing watch rows migrate intent and calls out of legacy storage atomica
     f.store.db
       .prepare("UPDATE watches SET target=? WHERE id=?")
       .run(JSON.stringify({ ...target, calls: 7 }), w.watch_id);
-    f.store.put("watch-intent", w.watch_id, "legacy waiting intent");
     f.store.db.exec(
-      "ALTER TABLE watches DROP COLUMN waiting_for; ALTER TABLE watches DROP COLUMN calls; ALTER TABLE watches ADD COLUMN last_notified_sent_at TEXT",
+      "ALTER TABLE watches ADD COLUMN waiting_for TEXT NOT NULL DEFAULT ''; ALTER TABLE watches ADD COLUMN calls INTEGER NOT NULL DEFAULT 0; ALTER TABLE watches ADD COLUMN last_notified_sent_at TEXT",
     );
-    upgraded = new Watches(f.store, f.sender, f.config, { now: f.now });
-    let row = f.store.db
-      .prepare("SELECT waiting_for,calls,target FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.ok(
-      !f.store.db
+    f.store.db
+      .prepare("INSERT INTO watch_handled VALUES(?,?,?)")
+      .run(w.watch_id, "earlier", new Date(f.now()).toISOString());
+    f.store.put("watch-intent", w.watch_id, "old intent");
+    for (let i = 0; i < 2; i++) {
+      upgraded = new Watches(f.store, f.sender, {
+        now: f.now,
+        deliver: async (_, notice) => {
+          f.notices.push(notice);
+        },
+      });
+      const columns = f.store.db
         .prepare("PRAGMA table_info(watches)")
         .all()
-        .some((c) => c.name === "last_notified_sent_at"),
-    );
-    assert.equal(row.waiting_for, "legacy waiting intent");
-    assert.equal(row.calls, 7);
-    assert.ok(!("calls" in JSON.parse(String(row.target))));
-    assert.equal(f.store.all("watch-intent").length, 0);
-    await upgraded.close();
-    upgraded = new Watches(f.store, f.sender, f.config, { now: f.now });
-    row = f.store.db
-      .prepare("SELECT waiting_for,calls FROM watches WHERE id=?")
-      .get(w.watch_id)!;
-    assert.equal(row.waiting_for, "legacy waiting intent");
-    assert.equal(row.calls, 7);
+        .map((c) => c.name);
+      for (const field of ["waiting_for", "calls", "last_notified_sent_at"])
+        assert.ok(!columns.includes(field));
+      assert.equal(upgraded.status(f.p.id)[0]?.target, `codex:${thread}`);
+      assert.equal(
+        f.store.db
+          .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+          .get(w.watch_id)?.n,
+        1,
+      );
+      assert.equal(f.store.all("watch-intent").length, 0);
+      assert.ok(
+        !(
+          "calls" in
+          JSON.parse(
+            String(
+              f.store.db
+                .prepare("SELECT target FROM watches WHERE id=?")
+                .get(w.watch_id)?.target,
+            ),
+          )
+        ),
+      );
+      if (i === 1) {
+        f.message("new-reply", { mentions: ["me"] });
+        await upgraded.tick();
+        f.advance(10000);
+        await upgraded.tick();
+        assert.equal(f.notices.length, 1);
+      }
+      await upgraded.close();
+    }
   } finally {
     await upgraded?.close();
     await f.close();
   }
 });
-
 test("late arrivals sent before the last delivered reply still notify", async () => {
   const f = fixture();
   try {
@@ -671,7 +578,7 @@ test("clean database restart and edits after delivery do not repeat a notice", a
     await f.watches.close();
     f.store.close();
     reopened = new Store(f.dir);
-    restarted = new Watches(reopened, f.sender, f.config, {
+    restarted = new Watches(reopened, f.sender, {
       now: f.now,
       deliver: async (_, n) => {
         f.notices.push(n);
@@ -702,34 +609,31 @@ test("clean database restart and edits after delivery do not repeat a notice", a
     await f.close();
   }
 });
-test("unrelated group replies are durably handled without another relevance call across ticks or restart", async () => {
+test("other group messages are handled immediately and not re-checked across restart", async () => {
   const f = fixture(true);
   let reopened: Store | undefined, restarted: Watches | undefined;
   try {
     const w = f.watch();
-    f.message("irrelevant");
-    f.script({ relevant_ids: [] });
-    await f.tick();
-    f.advance(10000);
+    f.message("anchor", { sentAt: "2026-11-02T09:59:59.000Z" });
+    f.message("irrelevant", { replyId: "anchor" });
     await f.tick();
     assert.equal(f.notices.length, 0);
     assert.equal(
-      f.store.db.prepare("SELECT calls FROM watches WHERE id=?").get(w.watch_id)
-        ?.calls,
-      1,
-    );
-    await f.tick();
-    f.advance(10000);
-    await f.tick();
-    assert.equal(
-      f.store.db.prepare("SELECT calls FROM watches WHERE id=?").get(w.watch_id)
-        ?.calls,
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
       1,
     );
     await f.watches.close();
     f.store.close();
     reopened = new Store(f.dir);
-    restarted = new Watches(reopened, f.sender, f.config, {
+    let checks = 0;
+    const find = reopened.findMessage.bind(reopened);
+    reopened.findMessage = (id) => {
+      checks++;
+      return find(id);
+    };
+    restarted = new Watches(reopened, f.sender, {
       now: f.now,
       deliver: async (_, n) => {
         f.notices.push(n);
@@ -738,13 +642,14 @@ test("unrelated group replies are durably handled without another relevance call
     await restarted.tick();
     f.advance(10000);
     await restarted.tick();
+    assert.equal(checks, 0);
+    assert.equal(f.notices.length, 0);
     assert.equal(
       reopened.db
-        .prepare("SELECT calls FROM watches WHERE id=?")
-        .get(w.watch_id)?.calls,
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
       1,
     );
-    assert.equal(f.notices.length, 0);
   } finally {
     await restarted?.close();
     reopened?.close();
@@ -793,7 +698,7 @@ test("handled canonical identities survive duplicate message merging and watch e
 test("failed delivery leaves relevant messages unhandled until a retry succeeds", async () => {
   const f = fixture();
   let attempts = 0;
-  const watches = new Watches(f.store, f.sender, f.config, {
+  const watches = new Watches(f.store, f.sender, {
     now: f.now,
     deliver: async () => {
       if (++attempts === 1) throw Error("retry");
@@ -824,6 +729,68 @@ test("failed delivery leaves relevant messages unhandled until a retry succeeds"
     );
   } finally {
     await watches.close();
+    await f.close();
+  }
+});
+
+test("group quote, owner mention and named sender each notify without an AI layer", async () => {
+  for (const kind of ["quote", "mention", "sender"]) {
+    const f = fixture(true);
+    try {
+      f.message("owner", { direction: "outgoing" });
+      f.watch(kind === "sender" ? { from_participant_ids: ["person"] } : {});
+      f.message(
+        "reply",
+        kind === "quote"
+          ? { replyId: "owner" }
+          : kind === "mention"
+            ? { mentions: ["me"] }
+            : {},
+      );
+      await f.tick();
+      f.advance(10000);
+      await f.tick();
+      assert.equal(f.notices.length, 1, kind);
+      assert.match(f.notices[0], /1 new/);
+    } finally {
+      await f.close();
+    }
+  }
+});
+test("group matching is a union: unlisted sender quotes or mentions still notify", async () => {
+  const f = fixture(true);
+  try {
+    f.message("owner", { direction: "outgoing" });
+    const w = f.watch({ from_participant_ids: ["A"] });
+    f.message("quoteB", { senderId: "B", replyId: "owner" });
+    f.message("mentionB", { senderId: "B", mentions: ["me"] });
+    f.message("senderA", { senderId: "A" });
+    f.message("otherB", { senderId: "B" });
+    await f.tick();
+    assert.equal(
+      f.store.db
+        .prepare("SELECT count(*) n FROM watch_handled WHERE watch_id=?")
+        .get(w.watch_id)?.n,
+      1,
+    );
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    assert.match(f.notices[0], /3 new/);
+  } finally {
+    await f.close();
+  }
+});
+test("direct chats count every message even with a different named sender configured", async () => {
+  const f = fixture();
+  try {
+    f.watch({ from_participant_ids: ["different"] });
+    f.message("reply");
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+  } finally {
     await f.close();
   }
 });

@@ -319,7 +319,7 @@ export function createMcp(
   );
   register(
     "watch",
-    "Subscribe to incoming replies with pointer notices; groups require waiting_for. Codex: pass codex_thread_id from $CODEX_THREAD_ID or $CODEX_SESSION_ID in your shell. Claude Code uses its session automatically.",
+    "Subscribe to incoming replies with pointer notices. Codex: pass codex_thread_id from $CODEX_THREAD_ID or $CODEX_SESSION_ID in your shell. Claude Code uses its session automatically.",
     watchInput,
     (args, meta) => {
       if (!service.watches) throw new BridgeError("service_offline");

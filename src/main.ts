@@ -7,7 +7,6 @@ import { WhatsApp } from "./whatsapp.js";
 import { Service } from "./service.js";
 import { createApp } from "./server.js";
 import { Watches } from "./watches.js";
-import { classifierConfig } from "./reply-classifier.js";
 process.umask(0o077);
 const dir = resolve(process.env.BRIDGE_DATA_DIR || ".data");
 mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -42,12 +41,9 @@ const replySettingsPath = join(dir, "reply-settings.json");
 const settings = existsSync(replySettingsPath)
   ? JSON.parse(readFileSync(replySettingsPath, "utf8"))
   : {};
-const watches = new Watches(
-  store,
-  wa,
-  classifierConfig.parse(settings.classifier ?? {}),
-  { codex_executable: settings.codex_executable },
-);
+const watches = new Watches(store, wa, {
+  codex_executable: settings.codex_executable,
+});
 watches.start();
 const service = new Service(store, wa, watches);
 const app = createApp(service, wa, readFileSync(keyPath, "utf8").trim(), port);

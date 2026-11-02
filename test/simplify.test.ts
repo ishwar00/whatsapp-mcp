@@ -122,6 +122,11 @@ test("eight short tool contracts expose no legacy APIs or hidden caller credenti
       assert.equal(t.annotations?.readOnlyHint, t.name !== "send");
       assert.ok(!JSON.stringify(t.inputSchema).includes("_caller"));
     }
+    assert.ok(
+      !Object.keys(
+        tools.find((t) => t.name === "watch")!.inputSchema.properties!,
+      ).includes("waiting_for"),
+    );
     const schema = tools.find((t) => t.name === "read_messages")!.inputSchema;
     assert.deepEqual(
       Object.keys(schema.properties!).sort(),

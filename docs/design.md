@@ -18,7 +18,7 @@ flowchart TD
 
 Each send records an attempt before provider dispatch. The per-key request ID prevents a repeated or interrupted operation from sending twice. Human approval remains the client's permission rule on `send`.
 
-`watches.ts` persists active subscriptions and native delivery targets. It groups incoming messages, applies deterministic matches, and asks the isolated relevance runner about remaining group conversation. Only fixed pointer notices enter the agent session; the agent reads WhatsApp content through tools. `process.ts` contains shared executable lookup and bounded subprocess execution.
+`watches.ts` persists active subscriptions and native delivery targets. It groups incoming messages and matches owner quotes, owner mentions and selected group senders. Other group messages are recorded as handled without notifying. Only fixed pointer notices enter the agent session; the agent reads WhatsApp content through tools. `process.ts` contains executable lookup and bounded Codex queue execution.
 
 A local bearer key accesses all chats. Keys are hashed in storage. The service binds to loopback with Host and Origin checks. Agent keys cannot use owner endpoints. The data directory and native delivery credentials share the local user's trust boundary.
 

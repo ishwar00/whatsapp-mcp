@@ -109,12 +109,12 @@ To load older conversation, call `sync_history` with `chat_id` and optionally `b
 Claude Code identifies its session automatically through the stdio adapter:
 
 ```json
-{"chat_id":"chat_...","waiting_for":"confirmation that the DNS records were updated"}
+{"chat_id":"chat_..."}
 ```
 
 Codex also supplies `codex_thread_id`, obtained from `$CODEX_THREAD_ID` or `$CODEX_SESSION_ID` in its shell. A watch defaults to the latest outgoing message within 24 hours, and expires after one day. Set `since` or `timeout_seconds` to change those bounds.
 
-Groups require `waiting_for`. The service filters unrelated group conversation, coalesces replies, and sends a notice containing only IDs and a read instruction. The agent retrieves the actual content through `read_messages`. Watching grants no permission to send WhatsApp messages. See [watch setup and behavior](docs/watch.md).
+Groups notify for replies quoting your outgoing messages, mentions of you, or senders listed in `from_participant_ids`. Other group messages are ignored. The service coalesces replies and sends a notice containing only IDs and a read instruction. The agent retrieves the actual content through `read_messages`. Watching grants no permission to send WhatsApp messages. See [watch setup and behavior](docs/watch.md).
 
 ## How it runs
 
