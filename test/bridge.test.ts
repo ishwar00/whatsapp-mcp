@@ -122,97 +122,6 @@ test("combined filters, OR predicates, pagination and scoped reads", () => {
     f.close();
   }
 });
-test("draft request idempotency, explicit approval, and duplicate approval", async () => {
-  const f = fixture();
-  try {
-    const input = {
-      chat_id: f.a.id,
-      text: "Update DNS",
-      request_id: "request-1",
-    };
-    const draft = f.service.createDraft(f.p, input);
-    assert.equal(f.sends(), 0);
-    assert.equal(f.service.createDraft(f.p, input).id, draft.id);
-    assert.throws(() =>
-      f.service.createDraft(f.p, { ...input, text: "different" }),
-    );
-    assert.equal(
-      (await f.service.approve(draft.id, draft.digest)).status,
-      "accepted",
-    );
-    await f.service.approve(draft.id, draft.digest);
-    assert.equal(f.sends(), 1);
-    assert.throws(() => f.service.ownDraft({ ...f.p, id: "other" }, draft.id));
-  } finally {
-    f.close();
-  }
-});
-test("in-flight repeated approval and cancellation never create another send", async () => {
-  const f = fixture();
-  try {
-    let complete: (id: string) => void = () => {};
-    let calls = 0;
-    f.sender.send = () => {
-      calls++;
-      return new Promise((resolve) => {
-        complete = resolve;
-      });
-    };
-    const d = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "Hello",
-      request_id: "x",
-    });
-    const pending = f.service.approve(d.id, d.digest);
-    assert.equal(
-      (await f.service.approve(d.id, d.digest)).status,
-      "attempting",
-    );
-    assert.equal(f.service.cancel(f.p, d.id).status, "attempting");
-    complete("sent");
-    await pending;
-    assert.equal(calls, 1);
-  } finally {
-    f.close();
-  }
-});
-test("uncertain send is persistent and cannot be retried; interrupted attempt recovers as unknown", async () => {
-  const f = fixture();
-  try {
-    f.sender.send = async () => {
-      throw new Error("Connection lost");
-    };
-    const d = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "Hello",
-      request_id: "x",
-    });
-    assert.equal((await f.service.approve(d.id, d.digest)).status, "unknown");
-    assert.equal((await f.service.approve(d.id, d.digest)).status, "unknown");
-    f.store.saveDraft({ ...d, status: "attempting" });
-    f.store.close();
-    const reopened = new Store(f.dir);
-    assert.equal(reopened.draft(d.id).status, "unknown");
-    reopened.close();
-  } finally {
-    f.close();
-  }
-});
-test("sending rechecks client revocation, references and attachment digest", async () => {
-  const f = fixture();
-  try {
-    const d = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "Hello",
-      request_id: "x",
-    });
-    f.store.put("client", f.p.id, { ...f.p, enabled: false });
-    await assert.rejects(f.service.approve(d.id, d.digest));
-    assert.equal(f.sends(), 0);
-  } finally {
-    f.close();
-  }
-});
 test("attachment forwarding stays in scope; deleting a message destroys bytes and prevents resurrection", () => {
   const f = fixture();
   try {
@@ -268,30 +177,6 @@ test("SQLite Signal auth preserves key buffers and deletion across restart", asy
     f.close();
   }
 });
-test("draft schema rejects arbitrary paths, approval flags, and empty messages", () => {
-  assert.equal(
-    draftInputSchema.safeParse({
-      chat_id: "c",
-      text: "x",
-      request_id: "a",
-      approved: true,
-    }).success,
-    false,
-  );
-  assert.equal(
-    draftInputSchema.safeParse({
-      chat_id: "c",
-      text: "x",
-      request_id: "a",
-      file_path: "/etc/passwd",
-    }).success,
-    false,
-  );
-  assert.equal(
-    draftInputSchema.safeParse({ chat_id: "c", request_id: "a" }).success,
-    false,
-  );
-});
 test("real Streamable HTTP client, owner bearer authentication and origin/host checks", async () => {
   const f = fixture();
   const wa = new WhatsApp(f.store);
@@ -338,19 +223,8 @@ test("real Streamable HTTP client, owner bearer authentication and origin/host c
       }),
     );
     const list = await client.listTools();
-    assert.ok(list.tools.find((t) => t.name === "create_draft"));
-    assert.equal(
-      list.tools.some(
-        (t) => t.name.includes("approve") || t.name === "send_message",
-      ),
-      false,
-    );
-    const draftResult = await client.callTool({
-      name: "create_draft",
-      arguments: { chat_id: f.a.id, text: "Hello", request_id: "http-1" },
-    });
-    assert.equal(draftResult.isError, undefined);
-    assert.equal(f.sends(), 0);
+    assert.equal(list.tools.length, 8);
+    assert.ok(list.tools.find((t) => t.name === "send"));
     assert.equal(
       (
         await fetch(`${base}/owner/pairing`, {
@@ -368,11 +242,6 @@ test("real Streamable HTTP client, owner bearer authentication and origin/host c
       200,
     );
     assert.equal(f.sends(), 0);
-    const pending = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "Pending before permissions change",
-      request_id: "pending-edit",
-    });
     const originalHash = f.store.clients()[0]?.tokenHash;
     const headers = {
       "Content-Type": "application/json",
@@ -441,9 +310,10 @@ test("real Streamable HTTP client, owner bearer authentication and origin/host c
     assert.equal(
       (
         await client.callTool({
-          name: "create_draft",
+          name: "send",
           arguments: {
             chat_id: f.b.id,
+            to: "Private",
             text: "Blocked",
             request_id: "blocked",
           },
@@ -451,7 +321,6 @@ test("real Streamable HTTP client, owner bearer authentication and origin/host c
       ).isError,
       true,
     );
-    await assert.rejects(f.service.approve(pending.id, pending.digest));
     assert.equal(f.sends(), 0);
     assert.equal(
       (
@@ -469,15 +338,16 @@ test("real Streamable HTTP client, owner bearer authentication and origin/host c
     assert.equal(
       (
         await client.callTool({
-          name: "create_draft",
+          name: "send",
           arguments: {
             chat_id: f.a.id,
+            to: "Client A",
             text: "Enabled again",
             request_id: "after-edit",
           },
         })
       ).isError,
-      undefined,
+      true,
     );
     f.store.put("client", f.p.id, { ...f.p, enabled: false });
     assert.equal(
@@ -629,89 +499,6 @@ test("incoming direct messages are collected and accessible automatically", () =
       f.service.read(f.p, { chat_ids: [chat.id] }).messages.length,
       1,
     );
-  } finally {
-    f.close();
-  }
-});
-
-test("send_draft needs a send-enabled key and exact recipient, text and attachment names", async () => {
-  const f = fixture();
-  try {
-    const code = async (promise: Promise<unknown>) => {
-      try {
-        await promise;
-        return "ok";
-      } catch (e) {
-        return (e as { code?: string }).code ?? "error";
-      }
-    };
-    const draft = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "Order #9655 update",
-      request_id: "send-1",
-    });
-    const send = (
-      over: Partial<Record<"digest" | "chat" | "text", string>> = {},
-    ) =>
-      f.service.sendDraft(
-        f.p,
-        draft.id,
-        over.digest ?? draft.digest,
-        over.chat ?? "Client A",
-        over.text ?? "Order #9655 update",
-      );
-    assert.equal(await code(send()), "not_found_or_not_permitted");
-    f.store.put("client", f.p.id, { ...f.p, canSend: true });
-    assert.equal(await code(send({ chat: "Private" })), "request_conflict");
-    assert.equal(
-      await code(send({ text: "Order #9655 update!" })),
-      "request_conflict",
-    );
-    assert.equal(await code(send({ digest: "tampered" })), "request_conflict");
-    assert.equal(f.sends(), 0);
-    const sent = await send();
-    assert.equal(sent.status, "accepted");
-    assert.equal(f.sends(), 1);
-    assert.equal((await send()).status, "accepted");
-    assert.equal(f.sends(), 1);
-    const withFile = f.service.createDraft(f.p, {
-      chat_id: f.a.id,
-      text: "see file",
-      attachment: {
-        name: "a.txt",
-        mime_type: "text/plain",
-        data: Buffer.from("hi").toString("base64"),
-      },
-      request_id: "send-2",
-    });
-    assert.equal(
-      await code(
-        f.service.sendDraft(
-          f.p,
-          withFile.id,
-          withFile.digest,
-          "Client A",
-          "see file",
-        ),
-      ),
-      "request_conflict",
-    );
-    assert.equal(f.sends(), 1);
-    const sendFile = (names: string[]) =>
-      f.service.sendDraft(
-        f.p,
-        withFile.id,
-        withFile.digest,
-        "Client A",
-        "see file",
-        names,
-      );
-    assert.equal(await code(sendFile(["wrong.txt"])), "request_conflict");
-    assert.equal(f.sends(), 1);
-    assert.equal((await sendFile(["a.txt"])).status, "accepted");
-    assert.equal(f.sends(), 2);
-    assert.equal((await sendFile(["a.txt"])).status, "accepted");
-    assert.equal(f.sends(), 2);
   } finally {
     f.close();
   }
@@ -888,6 +675,64 @@ test("encrypted edits authenticate, update the original, and preserve the secret
   }
 });
 
+test("stdio reads do not wait behind an in-flight send", async () => {
+  const f = fixture();
+  f.store.put("client", f.p.id, { ...f.p, canSend: true });
+  let release = () => {};
+  let started = () => {};
+  const sending = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  f.sender.send = async () => {
+    started();
+    await held;
+    return "held-send";
+  };
+  const port = 33223;
+  const http = createApp(
+    f.service,
+    new WhatsApp(f.store),
+    "owner-key",
+    port,
+  ).listen(port, "127.0.0.1");
+  await new Promise<void>((resolve) => http.once("listening", resolve));
+  const proxy = createStdioProxy(`http://127.0.0.1:${port}/mcp`, "agent-key");
+  const client = new Client({ name: "concurrent-read", version: "1" });
+  const [local, remote] = InMemoryTransport.createLinkedPair();
+  try {
+    await proxy.connect(remote);
+    await client.connect(local);
+    const send = client.callTool({
+      name: "send",
+      arguments: {
+        chat_id: f.a.id,
+        to: "Client A",
+        text: "held",
+        request_id: "held",
+      },
+    });
+    await sending;
+    const read = await client.callTool(
+      { name: "get_status", arguments: {} },
+      undefined,
+      { timeout: 2_000 },
+    );
+    assert.equal(read.isError, undefined);
+    release();
+    assert.equal((await send).isError, undefined);
+  } finally {
+    release();
+    await client.close();
+    await proxy.close();
+    http.closeAllConnections();
+    await new Promise<void>((resolve) => http.close(() => resolve()));
+    f.close();
+  }
+});
+
 test("HTTP and stdio clients send without elicitation and do not resend accepted drafts", async () => {
   const f = fixture();
   f.store.put("client", f.p.id, { ...f.p, canSend: true });
@@ -921,34 +766,28 @@ test("HTTP and stdio clients send without elicitation and do not resend accepted
       }),
     );
     for (const [i, client] of clients.entries()) {
-      const draft = f.service.createDraft(f.p, {
+      const args = {
         chat_id: f.a.id,
+        to: "Client A",
         text: "Client approved test",
         request_id: `client-approved-${i}`,
-      });
-      const args = {
-        draft_id: draft.id,
-        digest: draft.digest,
-        chat_name: "Client A",
-        text: draft.input.text,
       };
       assert.equal(
         (
           await client.callTool({
-            name: "send_draft",
-            arguments: { ...args, text: "changed" },
+            name: "send",
+            arguments: { ...args, to: "wrong person" },
           })
         ).isError,
         true,
       );
       assert.equal(f.sends(), i);
       assert.equal(
-        (await client.callTool({ name: "send_draft", arguments: args }))
-          .isError,
+        (await client.callTool({ name: "send", arguments: args })).isError,
         undefined,
       );
       assert.equal(f.sends(), i + 1);
-      await client.callTool({ name: "send_draft", arguments: args });
+      await client.callTool({ name: "send", arguments: args });
       assert.equal(f.sends(), i + 1);
     }
   } finally {
@@ -1021,14 +860,12 @@ test("adapter reconnects expired reads once and never automatically replays a se
     await Promise.all([proxy.connect(a), client.connect(b)]);
     await assert.rejects(status(), /503/);
     const connected = await status();
-    assert.match(JSON.stringify(connected), /Client-enforced approval/);
+    assert.match(JSON.stringify(connected), /watches/);
     await expireSession();
-    assert.match(JSON.stringify(await status()), /Client-enforced approval/);
+    assert.match(JSON.stringify(await status()), /watches/);
     await expireSession();
     assert.ok(
-      (await client.listTools()).tools.some(
-        (tool) => tool.name === "send_draft",
-      ),
+      (await client.listTools()).tools.some((tool) => tool.name === "send"),
     );
     await expireSession();
     const localRead = await client.callTool({
@@ -1038,45 +875,39 @@ test("adapter reconnects expired reads once and never automatically replays a se
     assert.equal(localRead.isError, undefined);
     assert.equal(calls.filter((name) => name === "read_messages").length, 2);
     await expireSession();
-    await assert.rejects(
-      client.callTool({ name: "sync_history", arguments: { chat_id: f.a.id } }),
-      /404/,
-    );
-    assert.equal(calls.filter((name) => name === "sync_history").length, 1);
+    await client.callTool({
+      name: "sync_history",
+      arguments: { chat_id: f.a.id },
+    });
+    assert.equal(calls.filter((name) => name === "sync_history").length, 2);
     await status();
-    const draft = f.service.createDraft(f.p, {
+    const args = {
       chat_id: f.a.id,
+      to: "Client A",
       text: "Recovery test",
       request_id: "recovery-test",
-    });
-    const args = {
-      draft_id: draft.id,
-      digest: draft.digest,
-      chat_name: "Client A",
-      text: draft.input.text,
     };
     await expireSession();
     await assert.rejects(
-      client.callTool({ name: "send_draft", arguments: args }),
+      client.callTool({ name: "send", arguments: args }),
       /404/,
     );
-    assert.equal(calls.filter((name) => name === "send_draft").length, 1);
+    assert.equal(calls.filter((name) => name === "send").length, 1);
     assert.equal(prompts, 0);
     assert.equal(f.sends(), 0);
-    assert.equal(f.store.draft(draft.id).status, "pending");
-    assert.match(JSON.stringify(await status()), /Client-enforced approval/);
+    assert.match(JSON.stringify(await status()), /watches/);
     assert.equal(
-      (await client.callTool({ name: "send_draft", arguments: args })).isError,
+      (await client.callTool({ name: "send", arguments: args })).isError,
       undefined,
     );
     assert.equal(prompts, 0);
     assert.equal(f.sends(), 1);
     await expireSession();
     await assert.rejects(
-      client.callTool({ name: "send_draft", arguments: args }),
+      client.callTool({ name: "send", arguments: args }),
       /404/,
     );
-    await client.callTool({ name: "send_draft", arguments: args });
+    await client.callTool({ name: "send", arguments: args });
     assert.equal(prompts, 0);
     assert.equal(f.sends(), 1);
     const before = calls.filter((name) => name === "get_status").length;
@@ -1096,7 +927,7 @@ test("adapter reconnects expired reads once and never automatically replays a se
       1,
     );
     rejectSessions = false;
-    assert.match(JSON.stringify(await status()), /Client-enforced approval/);
+    assert.match(JSON.stringify(await status()), /watches/);
   } finally {
     await client.close();
     await proxy.close();
@@ -1129,21 +960,15 @@ test("legacy chat restrictions are ignored and new groups need no grant, but rev
       f.service.read(f.p, { chat_ids: [chatId] }).messages[0]?.text,
       "hello",
     );
-    const d = f.service.createDraft(f.p, {
-      chat_id: chatId,
-      text: "reply",
-      request_id: "all-chat-draft",
-    });
     assert.equal(f.sends(), 0);
     f.store.put("client", f.p.id, { ...f.p, canSend: false });
     await assert.rejects(
-      f.service.sendDraft(
-        f.p,
-        d.id,
-        d.digest,
-        f.store.chat(chatId).name,
-        "reply",
-      ),
+      f.service.send(f.p, {
+        chat_id: chatId,
+        to: f.store.chat(chatId).name,
+        text: "reply",
+        request_id: "revoked",
+      }),
     );
     assert.equal(f.sends(), 0);
     f.store.put("client", f.p.id, { ...f.p, enabled: false });
@@ -1270,161 +1095,6 @@ test("reactions expose emoji and target, including removals and retained-event r
     assert.equal(f.store.message(id).deleted, true);
     assert.equal(f.sends(), 0);
   } finally {
-    f.close();
-  }
-});
-
-test("MCP accepts ZIP drafts, exposes filenames for approval, and sends the stored attachment once", async () => {
-  const f = fixture();
-  const server = createMcp(f.service, new WhatsApp(f.store), f.p);
-  const client = new Client({ name: "zip-test", version: "1" });
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  try {
-    await Promise.all([server.connect(a), client.connect(b)]);
-    const listed = await client.listTools();
-    assert.match(
-      JSON.stringify(listed.tools.find((t) => t.name === "create_draft")),
-      /application\/zip/,
-    );
-    assert.match(
-      JSON.stringify(listed.tools.find((t) => t.name === "send_draft")),
-      /attachment_names/,
-    );
-    const bytes = Buffer.from("PK\u0005\u0006" + "\u0000".repeat(18));
-    const created = await client.callTool({
-      name: "create_draft",
-      arguments: {
-        chat_id: f.a.id,
-        text: "invoices",
-        request_id: "zip-test",
-        attachment: {
-          name: "invoices.zip",
-          mime_type: "application/zip",
-          data: bytes.toString("base64"),
-        },
-      },
-    });
-    assert.ok(!created.isError);
-    assert.match(JSON.stringify(created), /attachment_names/);
-    const draft = f.store.drafts()[0]!;
-    const aid = draft.input.attachment_ids[0]!;
-    assert.deepEqual(f.store.attachments.read(aid).data, bytes);
-    assert.equal(f.store.attachments.read(aid).meta.mime, "application/zip");
-    f.store.put("client", f.p.id, { ...f.p, canSend: true });
-    const args = {
-      draft_id: draft.id,
-      digest: draft.digest,
-      chat_name: "Client A",
-      text: "invoices",
-    };
-    const missing = await client.callTool({
-      name: "send_draft",
-      arguments: args,
-    });
-    assert.equal(missing.isError, true);
-    assert.equal(f.sends(), 0);
-    const sent = await client.callTool({
-      name: "send_draft",
-      arguments: { ...args, attachment_names: ["invoices.zip"] },
-    });
-    assert.ok(!sent.isError);
-    assert.equal(f.store.draft(draft.id).status, "accepted");
-    assert.equal(f.sends(), 1);
-    await client.callTool({
-      name: "send_draft",
-      arguments: { ...args, attachment_names: ["invoices.zip"] },
-    });
-    assert.equal(f.sends(), 1);
-  } finally {
-    await client.close();
-    await server.close();
-    f.close();
-  }
-});
-
-test("MCP accepts DOCX and the WhatsApp document path preserves MIME, name, bytes and an empty caption", async () => {
-  const f = fixture();
-  const wa = new WhatsApp(f.store);
-  const mime =
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const bytes = Buffer.from("Word document transport fixture\0\xff", "latin1");
-  let sends = 0;
-  wa.connected = true;
-  // Stub only the external provider; exercise the actual MCP, storage and send path.
-  Object.defineProperty(wa, "socket", {
-    value: {
-      sendMessage: async (
-        ...[jid, content]: Parameters<
-          NonNullable<WhatsApp["socket"]>["sendMessage"]
-        >
-      ) => {
-        sends++;
-        assert.equal(jid, f.a.jid);
-        assert.ok("document" in content);
-        assert.deepEqual(content.document, bytes);
-        assert.equal(content.mimetype, mime);
-        assert.equal(content.fileName, "resume.docx");
-        assert.equal(content.caption, "");
-        return { key: { id: "docx-provider-id" } };
-      },
-    },
-  });
-  f.store.put("client", f.p.id, { ...f.p, canSend: true });
-  const service = new Service(f.store, wa);
-  const server = createMcp(service, wa, f.p);
-  const client = new Client({ name: "docx-test", version: "1" });
-  const [a, b] = InMemoryTransport.createLinkedPair();
-  try {
-    await Promise.all([server.connect(a), client.connect(b)]);
-    assert.ok(
-      JSON.stringify(
-        (await client.listTools()).tools.find((t) => t.name === "create_draft"),
-      ).includes(mime),
-    );
-    const created = await client.callTool({
-      name: "create_draft",
-      arguments: {
-        chat_id: f.a.id,
-        request_id: "docx-test",
-        attachment: {
-          name: "resume.docx",
-          mime_type: mime,
-          data: bytes.toString("base64"),
-        },
-      },
-    });
-    assert.ok(!created.isError);
-    const draft = f.store.drafts()[0]!;
-    const stored = f.store.attachments.read(draft.input.attachment_ids[0]!);
-    assert.equal(stored.meta.mime, mime);
-    assert.equal(stored.meta.name, "resume.docx");
-    assert.deepEqual(stored.data, bytes);
-    const args = {
-      draft_id: draft.id,
-      digest: draft.digest,
-      chat_name: f.a.name,
-      text: "",
-      attachment_names: ["resume.docx"],
-    };
-    assert.equal(
-      (
-        await client.callTool({
-          name: "send_draft",
-          arguments: { ...args, attachment_names: [] },
-        })
-      ).isError,
-      true,
-    );
-    assert.equal(sends, 0);
-    assert.ok(
-      !(await client.callTool({ name: "send_draft", arguments: args })).isError,
-    );
-    assert.equal(f.store.draft(draft.id).providerId, "docx-provider-id");
-    await client.callTool({ name: "send_draft", arguments: args });
-    assert.equal(sends, 1);
-  } finally {
-    await client.close();
-    await server.close();
     f.close();
   }
 });

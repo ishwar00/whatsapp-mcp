@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""PreToolUse hook for mcp__whatsapp__send_draft.
+"""PreToolUse hook that asks before mcp__whatsapp__send.
 
-Always forces Claude Code's permission prompt and puts the exact recipient and text in it.
-The bridge refuses the send unless recipient, text and filenames match the frozen draft, so what this
-prompt shows is what goes out. Paired with permissions.ask in ~/.claude/settings.json.
+Pair with permissions.ask in Claude Code's settings.
 """
 import json
 import sys
 
 tool_input = json.load(sys.stdin).get("tool_input", {})
 reason = "Send WhatsApp to {}:\n\n{}".format(
-    tool_input.get("chat_name", "?"), tool_input.get("text", "")
+    tool_input.get("to", "?"), tool_input.get("text", "")
 )
-names = tool_input.get("attachment_names", [])
-if names:
-    reason += "\n\nAttachments: " + ", ".join(names)
+file_path = tool_input.get("file_path")
+if file_path:
+    reason += "\n\nFile: " + file_path
 print(
     json.dumps(
         {

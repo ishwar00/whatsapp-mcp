@@ -1,49 +1,20 @@
 # WhatsApp MCP
 
-Connect Claude Code, Codex, and other MCP clients to your existing WhatsApp account.
-Read chats, retrieve images and documents, draft replies, and approve messages before
-sending them.
+Connect Claude Code and Codex to your existing WhatsApp number. Read chats, download attachments, send approved messages, and get notified when replies arrive.
 
-Each person runs their own local service and pairs their own number through
-[Baileys](https://github.com/WhiskeySockets/Baileys). This is an unofficial WhatsApp
-integration. No WhatsApp Business account, OpenAI API key, or Anthropic API key is
-needed by the server.
+Each person runs one local service and pairs their own account through [Baileys](https://github.com/WhiskeySockets/Baileys). This is an unofficial WhatsApp integration. No WhatsApp Business account is required.
 
 ## Set up with your agent
 
-Give Claude Code or Codex this repository and ask:
+Give your agent this repository and ask:
 
-> Set up WhatsApp MCP locally. Configure it to start when I log in, connect this
-> client through the stdio adapter, and require approval before every send. Follow
-> the README, preserve my existing settings, and verify the connection without
-> sending a message.
+> Set up WhatsApp MCP locally, start the service at login, and connect this client through the stdio adapter. Require human approval on every `send`. Preserve existing client settings and verify reads without sending a message.
 
-Your agent can handle installation and configuration. You need to scan the pairing
-QR in WhatsApp and approve any requested system changes. The steps below also work
-for manual setup.
-
-## How it runs
-
-```mermaid
-flowchart LR
-    C[Claude Code] <-->|stdio| A[Adapter]
-    X[Codex] <-->|stdio| B[Adapter]
-    A <-->|local HTTP| S[Shared WhatsApp service]
-    B <-->|local HTTP| S
-    S <--> W[WhatsApp linked device]
-    S <--> D[(Local SQLite database)]
-```
-
-Each client starts its own stdio adapter. The adapter connects to the background
-service at `http://127.0.0.1:3210/mcp`; it does not start that service. Keep one
-service running per account so clients share the connection and messages can be
-received while the clients are closed. Collection pauses when the service is
-stopped or the computer is asleep or offline. Older history is not guaranteed.
+You scan the QR in **WhatsApp → Settings → Linked devices → Link a device**. Your agent can handle the remaining setup.
 
 ## Install and pair
 
-Requires Node.js **22.16+** and npm on macOS or Linux. Claude Code's send approval
-hook also requires Python 3.
+Requires Node.js 22.16+ and npm on macOS or Linux.
 
 ```sh
 git clone https://github.com/ishwar00/whatsapp-mcp.git
@@ -53,18 +24,16 @@ npm run build
 npm start
 ```
 
-Keep this terminal open. In a second terminal, from the same repository directory:
+Keep that terminal running. In another terminal, from the repository:
 
 ```sh
 npm run owner -- pair
+npm run owner -- key "My agent" --send
 ```
 
-Scan the QR from **WhatsApp → Settings → Linked devices → Link a device**.
-The command prints `WhatsApp: connected` when pairing succeeds.
+Save the printed client key for the configuration below. Omit `--send` for a read-only key.
 
-### Start the service at login
-
-On macOS, stop the foreground server with Ctrl+C, then run from the repository:
+On macOS, stop the foreground service with Ctrl+C and install the login service:
 
 ```sh
 npm run owner -- launchd
@@ -74,64 +43,27 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.local.whatsapp-age
 npm run owner -- status
 ```
 
-This starts the service now, starts it when you log in, and restarts it if it exits.
-Keep the repository and Node executable at their installed paths. Do not also run
-`npm start` while this service is loaded.
+On Linux, use your process manager to run `node /absolute/path/to/whatsapp-mcp/dist/main.js` with the repository as the working directory. Run one service per account.
 
-On Linux, configure your process manager to run `node /absolute/path/to/whatsapp-mcp/dist/main.js`
-with the repository as its working directory. Without a process manager, keep
-`npm start` running in a terminal.
-
-## Connect your client through stdio
-
-First create a key that can read and draft:
+## Connect Claude Code
 
 ```sh
-npm run owner -- key "My agent"
-```
-
-Save the printed bearer token. Replace `YOUR_CLIENT_KEY` below with that token and
-`/absolute/path/to/whatsapp-mcp` with your checkout path. Use an absolute Node
-executable path if your desktop client cannot find `node`.
-
-### Claude Code
-
-```sh
-claude mcp add --scope user \
-  --env WHATSAPP_BRIDGE_TOKEN=YOUR_CLIENT_KEY --transport stdio \
+claude mcp add --scope user --transport stdio \
+  --env WHATSAPP_BRIDGE_TOKEN=YOUR_CLIENT_KEY \
   whatsapp -- node /absolute/path/to/whatsapp-mcp/dist/stdio.js
 ```
 
-For send-enabled keys, copy the included approval hook:
-
-```sh
-mkdir -p ~/.claude/hooks
-cp examples/claude-send-approval.py ~/.claude/hooks/whatsapp-send-ask.py
-```
-
-Merge this into `~/.claude/settings.json`, preserving existing settings:
+Merge the approval rule into `~/.claude/settings.json`:
 
 ```json
-{
-  "permissions": { "ask": ["mcp__whatsapp__send_draft"] },
-  "hooks": {
-    "PreToolUse": [{
-      "matcher": "mcp__whatsapp__send_draft",
-      "hooks": [{
-        "type": "command",
-        "command": "python3 ~/.claude/hooks/whatsapp-send-ask.py"
-      }]
-    }]
-  }
-}
+{"permissions":{"ask":["mcp__whatsapp__send"]}}
 ```
 
-The hook displays the recipient, exact text, and attachment filenames. Its matcher
-assumes you named the MCP connection `whatsapp`.
+The optional [approval hook](examples/claude-send-approval.py) forces an ask decision and displays the recipient, text and file path. Its matcher is `mcp__whatsapp__send`; keep that rule aligned with the MCP connection name.
 
-### Codex
+## Connect Codex
 
-Merge this into `~/.codex/config.toml`, preserving existing settings:
+Merge into `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.whatsapp]
@@ -141,171 +73,76 @@ args = ["/absolute/path/to/whatsapp-mcp/dist/stdio.js"]
 [mcp_servers.whatsapp.env]
 WHATSAPP_BRIDGE_TOKEN = "YOUR_CLIENT_KEY"
 
-[mcp_servers.whatsapp.tools.send_draft]
+[mcp_servers.whatsapp.tools.send]
 approval_mode = "prompt"
 ```
 
-The token is passed directly to the adapter, including when Codex launches from a
-desktop app. Keep this user configuration private. See the
-[Codex configuration reference](https://developers.openai.com/codex/config-reference).
+Use an absolute Node executable path if your desktop client cannot find `node`. Reconnect the client, call `get_status`, and list chats to verify setup. Check that `send` asks for approval before using a send-enabled connection. Approval belongs to the client; the service sends when that tool is called.
 
-### Enable sending and verify
+## Use the tools
 
-After configuring send approval in your client, create a send-enabled key:
+| Tool | What it does |
+|---|---|
+| `get_status` | Connection, history coverage and your active watches |
+| `list_chats` | Find names and aliases, counts and latest activity; `chat_id` includes observed participants |
+| `read_messages` | Read, search literal text, filter or retrieve nearby messages |
+| `get_attachment` | Write an attachment to disk and return its path; optionally show a small image |
+| `send` | Send text or one local file after client approval |
+| `sync_history` | Fetch older messages and wait up to 35 seconds |
+| `watch` | Notify this agent about incoming replies |
+| `unwatch` | Stop a watch |
 
-```sh
-npm run owner -- key "My agent with sending" --send
+Send a message with a readable recipient and a unique request ID:
+
+```json
+{"chat_id":"chat_...","to":"Samyak","text":"can you check this?","request_id":"dns-followup-1"}
 ```
 
-Replace the token in that client's MCP configuration with the new key. Keep the
-first key if you want a separate connection that can only read and draft.
-Restart or reconnect your client, then ask it to call `get_status` and list chats.
-The status should report `connected`. No message needs to be sent to verify setup.
+For a file, supply an absolute `file_path`; `text` becomes the caption. PNG, JPEG, PDF, ZIP, TXT and DOCX are supported, up to 5 MiB. Reusing the same request ID and payload returns its recorded outcome without sending again. `accepted` means WhatsApp accepted the send, not that it was delivered. For an `unknown` outcome, inspect WhatsApp before sending a replacement.
 
-All chats are available automatically. Reading does not mark messages as read.
-Only history received by this service is available; pairing and history requests
-do not guarantee that WhatsApp supplies every older message.
+Attachments download to `~/Downloads/whatsapp/` by default, or an absolute `save_to`. Files are never returned as base64 text. `view:true` includes the original image only when it is at most 1 MB.
 
-### Other clients and direct HTTP
+To load older conversation, call `sync_history` with `chat_id` and optionally `before_message_id` and `max_batches`. If `done:false`, repeat the same arguments to wait on the shared job. Then issue a fresh `read_messages` query. WhatsApp decides how much history to provide; empty results and timeouts do not prove older messages are absent.
 
-Clients with stdio support can run the same `dist/stdio.js` command with
-`WHATSAPP_BRIDGE_TOKEN` set. To change its destination, set
-`WHATSAPP_BRIDGE_URL` to the service's full MCP URL.
+## Get reply notifications
 
-Clients with Streamable HTTP support can connect directly to
-`http://127.0.0.1:3210/mcp` using `Authorization: Bearer YOUR_CLIENT_KEY`.
-Both transports use the same service, keys, and tools. Require approval before
-**every** `send_draft`. If a client cannot enforce approval, use a key without
-`--send`.
+Claude Code identifies its session automatically through the stdio adapter:
 
-## Tools and sending
+```json
+{"chat_id":"chat_..."}
+```
 
-| Tools | Purpose |
-|---|---|
-| `get_status`, `list_chats`, `list_participants` | Connection and conversation discovery |
-| `read_messages`, `search_messages`, `get_context` | Read, filter, search literal text, and retrieve nearby messages |
-| `get_attachment` | Images as MCP image content; files as bounded base64 |
-| `create_draft`, `list_drafts`, `get_operation`, `cancel_draft` | Prepare replies and inspect outcomes |
-| `send_draft` | Send an exact draft after the client obtains human approval |
+Codex also supplies `codex_thread_id`, obtained from `$CODEX_THREAD_ID` or `$CODEX_SESSION_ID` in its shell. A watch defaults to the latest outgoing message within 24 hours, and expires after one day. Set `since` or `timeout_seconds` to change those bounds.
 
-Drafting sends nothing. Sending validates the key, recipient name, exact text,
-attachment filenames, digest, references, and draft state. Echo the exact
-`attachment_names` returned by `create_draft` so the approval shows the filenames.
-Each draft supports one image, Word DOCX, PDF, text file, or ZIP up to **5 MiB**.
+Groups notify for replies quoting your outgoing messages, mentions of you, or senders listed in `from_participant_ids`. Other group messages are ignored. The service coalesces replies and sends a notice containing only IDs and a read instruction. The agent retrieves the actual content through `read_messages`. Watching grants no permission to send WhatsApp messages. See [watch setup and behavior](docs/watch.md).
 
-Approval is **client-enforced**. The server does not independently prove a human
-approved the call. Use client permissions,
-not just a prompt instruction, to enforce review. Accepted means provider
-acceptance, not delivery. An uncertain or accepted draft is never automatically
-resent; inspect WhatsApp before making a replacement draft.
+## How it runs
 
-## Load older conversations
+```mermaid
+flowchart LR
+    C[Claude Code] <-->|stdio| A[Adapter]
+    X[Codex] <-->|stdio| B[Adapter]
+    A <-->|local HTTP| S[WhatsApp service]
+    B <-->|local HTTP| S
+    S <--> W[WhatsApp linked device]
+    S <--> D[(SQLite)]
+    S -->|pointer notice| C
+    S -->|pointer notice| X
+```
 
-Ask your agent to "load the September conversation in this chat" or "search older
-messages for the DNS change". The service stores retrieved history so every connected
-agent can reuse it.
+Clients launch their own adapter, which connects to the shared background service at `http://127.0.0.1:3210/mcp`. Set `WHATSAPP_BRIDGE_URL` to change that URL. Streamable HTTP clients can connect directly with `Authorization: Bearer YOUR_CLIENT_KEY`; automatic Claude session routing requires the stdio adapter.
 
-1. Call `sync_history` with `chat_id`, optional `sent_at` date range, and a batch
-   budget `max_batches` from 1 to 10, default 3.
-2. Poll `get_history_status` using the returned `id` as `job_id`.
-3. Call `read_messages` or `search_messages` locally with the desired filters.
-   Start a fresh query without a previous page cursor to include arriving messages.
+All chats are available automatically. Reads do not mark messages as read. Collection pauses when the service stops, the computer sleeps or the connection goes offline. New pairings request full history; `WHATSAPP_HISTORY_MODE=recent` requests lighter initial sync.
 
-Reads and searches never initiate network fetching. Their `chat_coverage` includes
-stored date bounds and count for each requested chat, including when a search finds
-nothing. Bounds do not prove every message between those dates is present.
+The private `.data` directory holds SQLite, linked-device credentials and the owner key. Messages expire after 90 days; retained media is capped at 512 MiB. Deleted and expired content cannot be restored by stale history. View-once media is not archived. Stop the service before running `npm run owner -- backup /absolute/private/backup`.
 
-Without a date range, sync starts at the oldest usable stored raw message. For a
-range, it starts at the nearest usable message at or after `to`, falling back to
-the newest available message if necessary. It never treats an unrelated earlier
-stored message as evidence that the requested period was fetched. You can supply
-`before_message_id` to choose a specific starting anchor.
+## Troubleshoot
 
-Each batch requests 50 messages. A completed response supplies the next anchor,
-even if those messages were already stored. `traversed_from` and `traversed_to`
-show the actual dates walked by completed responses. They may differ from the
-requested dates and still do not establish gap-free coverage. `next_message_id`
-is the last confirmed cursor, usable as `before_message_id` on a later request.
-
-Jobs match responses by request ID. A matching chunk with `progress: 100` confirms
-completion; neither a first chunk nor a fixed pause does. Each batch has a 30-second
-deadline covering dispatch and response. If data arrives without confirmation, the
-job ends `response_incomplete`; the messages remain available to local queries.
-Uncorrelated chunks are stored normally but cannot complete or advance a job.
-
-Other terminal outcomes are `target_reached`, `batch_limit`, `no_progress`,
-`timed_out`, `no_anchor`, `offline`, `failed`, and `interrupted`. None proves that
-WhatsApp has no older messages. `messages_added` counts new messages in matching
-responses, excluding duplicates and unrelated live traffic.
-
-Requests are serialized. Matching requests for one chat share an active job;
-a different scope returns `busy` with the existing job ID. Jobs survive client
-disconnects; a service restart marks unfinished jobs `interrupted` without retrying
-them. The phone must be able to respond. Chats with no usable stored raw message
-need initial history or a new message before they can fetch earlier messages.
-
-New pairings request `syncFullHistory: true` using Baileys' default Chrome
-profile. Existing pairings keep their saved sync preference. Set
-`WHATSAPP_HISTORY_MODE=recent` for lighter initial sync, or `full` to request
-broader history. Pairing also enables history shared with you when you joined a
-group. Both modes keep the same browser identity. WhatsApp decides how
-much history it shares; full mode does not guarantee every older message.
-`get_status.history_sync` reports the configured mode and last history event or phase. Scrolling a separate WhatsApp Web session does not populate
-this service. Disappearing, deleted, expired, and view-once content still follows
-the existing retention rules. A recovered attachment message does not guarantee
-that WhatsApp still has its file bytes. The service asks the phone to refresh
-expired media references; if the phone cannot provide the file, the message and
-metadata remain readable.
-
-## Data and operation
-
-- Messages and attachment bytes are stored locally in `.data/bridge.sqlite`.
-  Linked-device credentials and the owner key are also stored in `.data`.
-  The server does not encrypt this directory. Keep it and backups private.
-- Message content expires after 90 days. Deleted and expired messages cannot be
-  restored by stale history events. Their stored attachments are also removed.
-- Media storage is limited to 512 MiB. View-once media is not archived.
-- Edits update the original message. Reactions include the emoji and target message.
-  Verified WhatsApp identity mappings reconcile direct chats; names alone do not
-  merge contacts.
-- Message tools support filtered reads and pagination. Text search matches literal
-  substrings without case sensitivity. See the [MCP contract](docs/mcp-contract.md)
-  for tool parameters and result semantics.
-- Run `npm run owner -- status` from the repository to check the connection.
-- To back up the database, stop the service and run
-  `npm run owner -- backup /absolute/private/backup`. Restart the service afterward.
-  The database backup does not include linked-device credentials or owner keys.
-  Never run a copied paired session alongside the original.
-- The HTTP service binds to loopback. The documented setup is for local clients
-  on the same computer.
-
-| Setting | Default | Used by |
-|---|---|---|
-| `BRIDGE_DATA_DIR` | `.data` relative to the working directory | Service and owner commands |
-| `BRIDGE_PORT` | `3210` | Service and owner commands |
-| `WHATSAPP_HISTORY_MODE` | `full` for new pairings; saved preference for existing pairings | Service |
-| `WHATSAPP_BRIDGE_TOKEN` | Required | Stdio adapter |
-| `WHATSAPP_BRIDGE_URL` | `http://127.0.0.1:3210/mcp` | Stdio adapter |
-
-Use the same data directory and port for the service and owner commands. The macOS
-helper records the data directory in its generated service definition. If you use
-a custom port, also add `BRIDGE_PORT` to that definition's `EnvironmentVariables`
-and update the adapter URL.
-
-## Troubleshooting
-
-- **Connection refused:** the adapter needs the background service. Check that the
-  service is running and that its port matches `WHATSAPP_BRIDGE_URL`.
-- **Node not found:** use the absolute path returned by `command -v node` in the
-  client's MCP configuration.
-- **Unauthorized:** check the agent token. Use the key command's bearer token,
-  not the owner key or client ID.
-- **Sending not permitted:** the connection needs a key created with `--send`.
-  Configure client approval before using that key.
-- **No approval prompt:** stop using the send-enabled connection until the client
-  policy is configured to ask. The service relies on that policy.
-- **Pairing timed out:** run `npm run owner -- pair` again. If status reports
-  `reauth_required`, stop the service and pair with a new `BRIDGE_DATA_DIR`.
+- **Connection refused:** start the background service and check `WHATSAPP_BRIDGE_URL`.
+- **Unauthorized:** use the printed client bearer token, not its client ID or the owner key.
+- **Sending not permitted:** create a key with `--send` after configuring client approval.
+- **No notification target:** call from Claude Code through stdio, or supply Codex's thread ID.
+- **No older messages:** keep the phone connected and inspect the sync result. A chat needs a known stored message to anchor a history request.
 
 ## Development
 
@@ -315,7 +152,4 @@ npm test
 npm run build
 ```
 
-Tests use real SQLite and MCP transports, with a test sender for network sends.
-Pairing and delivery require a live WhatsApp account.
-
-MIT licensed. See the [design](docs/design.md) and [MCP contract](docs/mcp-contract.md).
+Tests use SQLite and real MCP transports with fixture providers and notification receivers. See the [MCP contract](docs/mcp-contract.md) and [design](docs/design.md). MIT licensed.

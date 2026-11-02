@@ -13,19 +13,20 @@ import { pathToFileURL } from "node:url";
 
 const readTools = new Set([
   "get_status",
-  "get_history_status",
   "list_chats",
-  "list_participants",
   "read_messages",
-  "search_messages",
-  "get_context",
   "get_attachment",
-  "list_drafts",
-  "get_operation",
+  "sync_history",
+  "watch",
+  "unwatch",
 ]);
 
 // Forward tools to the local daemon; approval belongs to the client.
-export function createStdioProxy(url: string, token: string) {
+export function createStdioProxy(
+  url: string,
+  token: string,
+  startup: NodeJS.ProcessEnv = process.env,
+) {
   const server = new Server(
     { name: "whatsapp-mcp", version: "0.1.0" },
     { capabilities: { tools: {} } },
@@ -64,7 +65,10 @@ export function createStdioProxy(url: string, token: string) {
     try {
       return await action(client);
     } catch (error) {
-      if (!(error instanceof StreamableHTTPError) || error.code !== 404)
+      if (
+        upstream === connection &&
+        (!(error instanceof StreamableHTTPError) || error.code !== 404)
+      )
         throw error;
       if (upstream === connection) upstream = null;
       await client.close();
@@ -76,20 +80,40 @@ export function createStdioProxy(url: string, token: string) {
     withConnection((client) => client.listTools(), true),
   );
   server.setRequestHandler(CallToolRequestSchema, (request, extra) => {
-    // Serialize tool calls to preserve send order.
-    const result = queue.then(async () => {
+    const action = async () => {
+      let params = request.params;
+      if (params.name === "watch") {
+        const {
+          CLAUDE_CODE_MESSAGING_SOCKET: socket,
+          CLAUDE_CODE_MESSAGING_TOKEN: token,
+          CLAUDE_CODE_SESSION_ID: session_id,
+        } = startup;
+        params = {
+          ...params,
+          _meta: {
+            ...params._meta,
+            _caller:
+              socket && token && session_id
+                ? { socket, token, session_id }
+                : undefined,
+          },
+        };
+      }
       if (extra.signal.aborted) throw new Error("Request cancelled");
       {
         return await withConnection(
           (client) =>
-            client.callTool(request.params, undefined, {
+            client.callTool(params, undefined, {
               signal: extra.signal,
               timeout: 150_000,
             }),
           readTools.has(request.params.name),
         );
       }
-    });
+    };
+    if (readTools.has(request.params.name)) return action();
+    // Mutations stay ordered; reads must not wait for a send approval.
+    const result = queue.then(action);
     queue = result.catch(() => undefined);
     return result;
   });

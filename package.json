@@ -34,6 +34,6 @@
     "tsx": "^4.20.0",
     "typescript": "^5.8.0"
   },
-  "description": "Local WhatsApp MCP server for reading chats, drafting replies, and client-approved sends.",
+  "description": "Local WhatsApp MCP server for reading chats, downloading files, approved sends and reply notifications.",
   "license": "MIT"
 }

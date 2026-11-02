@@ -163,56 +163,6 @@ test("a single SQLite backup restores media bytes without any media directory", 
     rmSync(dest, { recursive: true, force: true });
   }
 });
-test("failed inline draft creation leaves neither a draft nor orphan attachment bytes", async () => {
-  const { Service } = await import("../src/service.js");
-  const dir = mkdtempSync(join(tmpdir(), "wa-draft-rollback-"));
-  const s = new Store(dir);
-  try {
-    const p = {
-      id: "agent",
-      name: "Agent",
-      enabled: true,
-      canDraft: true,
-      canSend: false,
-      tokenHash: hash("key"),
-    };
-    s.put("client", p.id, p);
-    const chat = s.saveChat("111@s.whatsapp.net", "Client");
-    const service = new Service(s, {
-      connected: false,
-      ownerIds: [],
-      send: async () => {
-        throw Error("no sends");
-      },
-    });
-    s.saveDraft = () => {
-      throw Error("simulated failure after media insert");
-    };
-    assert.throws(
-      () =>
-        service.createDraft(p, {
-          chat_id: chat.id,
-          text: "file",
-          request_id: "rollback",
-          attachment: {
-            name: "proof.pdf",
-            mime_type: "application/pdf",
-            data: Buffer.from("inline bytes").toString("base64"),
-          },
-        }),
-      /simulated failure/,
-    );
-    assert.equal(
-      s.db.prepare("SELECT count(*) n FROM attachments").get()?.n,
-      0,
-    );
-    assert.equal(s.db.prepare("SELECT count(*) n FROM requests").get()?.n, 0);
-    assert.equal(s.drafts().length, 0);
-  } finally {
-    s.close();
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
 test("orphaned legacy attachments retain their bytes as unattached records instead of blocking startup", () => {
   const dir = legacy();
   try {

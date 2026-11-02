@@ -420,29 +420,21 @@ test("MCP reads/searches stay local, coverage is included, explicit sync reports
       tools.some((t) => t.name === "get_history_coverage"),
       false,
     );
-    const oldOption = await call("search_messages", {
-      query: "older",
-      fetch_history: true,
-    });
-    assert.ok(Array.isArray(oldOption.messages));
-    assert.equal(f.store.all("history-job").length, 0);
-    const local = await call("search_messages", {
+    const local = await call("read_messages", {
       query: "older",
       chat_ids: [f.chat.id],
     });
     assert.equal(local.messages.length, 0);
     assert.equal(local.chat_coverage[0].stored_messages, 1);
     assert.equal(f.store.all("history-job").length, 0);
-    const queued = await call("sync_history", { chat_id: f.chat.id });
-    const result = await terminal(f.wa.history, queued.id);
+    const result = await call("sync_history", { chat_id: f.chat.id });
     assert.equal(result.state, "offline");
-    assert.equal(
-      (await call("get_history_status", { job_id: result.id })).state,
-      "offline",
-    );
+    assert.equal(result.done, true);
+    const empty = f.store.saveChat("empty@g.us", "Empty");
+    // offline takes precedence; no_anchor is tested with a connected provider below
     f.store.put("client", p.id, { ...p, enabled: false });
     assert.equal(
-      (await call("get_history_status", { job_id: result.id })).code,
+      (await call("read_messages", { chat_ids: [f.chat.id] })).code,
       "not_found_or_not_permitted",
     );
   } finally {

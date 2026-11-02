@@ -123,14 +123,25 @@ test("late identity merge deduplicates, preserves edits, files, quotes and immut
       attachmentId: aid,
       editedAt: "2026-10-18T00:00:01Z",
     });
-    const draft = f.service.createDraft(f.p, {
-      chat_id: oldChat,
-      text: "reply",
-      reply_to_message_id: oldId,
-      attachment_ids: [aid],
-      request_id: "immutable",
-    });
-    const frozen = JSON.stringify(draft);
+    const draft = {
+      id: "legacy",
+      clientId: f.p.id,
+      input: {
+        chat_id: oldChat,
+        text: "reply",
+        reply_to_message_id: oldId,
+        attachment_ids: [aid],
+        mention_ids: [],
+        request_id: "immutable",
+      },
+      digest: "legacy",
+      status: "accepted" as const,
+      createdAt: new Date().toISOString(),
+      providerId: "old-send",
+      error: null,
+    };
+    f.store.saveDraft(draft);
+    const frozen = JSON.stringify(f.store.draft(draft.id));
     f.store.addAlias(lid, pn);
     assert.equal(f.store.chats().length, 1);
     assert.equal(f.store.messages([oldChat]).length, 1);
@@ -144,7 +155,6 @@ test("late identity merge deduplicates, preserves edits, files, quotes and immut
     assert.equal(f.store.attachments.read(aid).meta.messageId, keep);
     assert.equal(JSON.stringify(f.store.draft(draft.id)), frozen);
     assert.equal(f.service.context(f.p, oldChat, oldId).messages[0]?.id, keep);
-    f.service.validateReferences(f.p, draft.input);
     assert.ok(f.store.get("raw", oldId));
     f.ingest(lid, "same", "stale replay");
     f.ingest(pn, "same", "stale replay");
@@ -153,14 +163,13 @@ test("late identity merge deduplicates, preserves edits, files, quotes and immut
     f.store.addAlias(lid, pn);
     assert.equal(
       (
-        await f.service.sendDraft(
-          f.p,
-          draft.id,
-          draft.digest,
-          "Client",
-          "reply",
-          ["proof.pdf"],
-        )
+        await f.service.send(f.p, {
+          chat_id: oldChat,
+          to: "Client",
+          text: "reply",
+          reply_to_message_id: oldId,
+          request_id: "alias-send",
+        })
       ).status,
       "accepted",
     );
@@ -318,7 +327,7 @@ test("encrypted edits survive a verified LID to phone transition without accepti
     f.close();
   }
 });
-test("merged mentions, old quote IDs and deletion through an old ID remain valid", () => {
+test("merged mentions, old quote IDs and deletion through an old ID remain valid", async () => {
   const f = setup();
   try {
     f.ingest(lid, "anchor", "original");
@@ -350,11 +359,11 @@ test("merged mentions, old quote IDs and deletion through an old ID remain valid
         .messages.length,
       1,
     );
-    f.service.validateReferences(f.p, {
+    await f.service.send(f.p, {
+      to: f.store.chat(opaque("chat", lid)).name,
       chat_id: opaque("chat", lid),
       text: "reply",
       request_id: "test",
-      attachment_ids: [],
       mention_ids: [opaque("participant", lid)],
       reply_to_message_id: oldId,
     });
