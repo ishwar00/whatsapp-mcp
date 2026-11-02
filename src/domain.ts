@@ -71,6 +71,7 @@ export const inlineSchema = z.object({
     "image/png",
     "image/jpeg",
     "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/zip",
     "text/plain",
   ]),

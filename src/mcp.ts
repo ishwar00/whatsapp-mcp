@@ -323,7 +323,7 @@ export function createMcp(
     .strict();
   register(
     "send_draft",
-    "Send one pending draft after the client has obtained human tool approval. Call only when the user asks to send this exact draft. chat_name, text and attachment_names must match the draft. Include the exact attachment_names returned by create_draft so filenames appear in approval. Supports one file per draft, including PDF and ZIP. Requires a send-enabled key.",
+    "Send one pending draft after the client has obtained human tool approval. Call only when the user asks to send this exact draft. chat_name, text and attachment_names must match the draft. Include the exact attachment_names returned by create_draft so filenames appear in approval. Supports one file per draft, including Word DOCX, PDF and ZIP. Requires a send-enabled key.",
     send,
     (args) => {
       const q = send.parse(args);

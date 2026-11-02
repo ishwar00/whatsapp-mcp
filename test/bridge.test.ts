@@ -1341,3 +1341,90 @@ test("MCP accepts ZIP drafts, exposes filenames for approval, and sends the stor
     f.close();
   }
 });
+
+test("MCP accepts DOCX and the WhatsApp document path preserves MIME, name, bytes and an empty caption", async () => {
+  const f = fixture();
+  const wa = new WhatsApp(f.store);
+  const mime =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+  const bytes = Buffer.from("Word document transport fixture\0\xff", "latin1");
+  let sends = 0;
+  wa.connected = true;
+  // Stub only the external provider; exercise the actual MCP, storage and send path.
+  Object.defineProperty(wa, "socket", {
+    value: {
+      sendMessage: async (
+        ...[jid, content]: Parameters<
+          NonNullable<WhatsApp["socket"]>["sendMessage"]
+        >
+      ) => {
+        sends++;
+        assert.equal(jid, f.a.jid);
+        assert.ok("document" in content);
+        assert.deepEqual(content.document, bytes);
+        assert.equal(content.mimetype, mime);
+        assert.equal(content.fileName, "resume.docx");
+        assert.equal(content.caption, "");
+        return { key: { id: "docx-provider-id" } };
+      },
+    },
+  });
+  f.store.put("client", f.p.id, { ...f.p, canSend: true });
+  const service = new Service(f.store, wa);
+  const server = createMcp(service, wa, f.p);
+  const client = new Client({ name: "docx-test", version: "1" });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  try {
+    await Promise.all([server.connect(a), client.connect(b)]);
+    assert.ok(
+      JSON.stringify(
+        (await client.listTools()).tools.find((t) => t.name === "create_draft"),
+      ).includes(mime),
+    );
+    const created = await client.callTool({
+      name: "create_draft",
+      arguments: {
+        chat_id: f.a.id,
+        request_id: "docx-test",
+        attachment: {
+          name: "resume.docx",
+          mime_type: mime,
+          data: bytes.toString("base64"),
+        },
+      },
+    });
+    assert.ok(!created.isError);
+    const draft = f.store.drafts()[0]!;
+    const stored = f.store.attachments.read(draft.input.attachment_ids[0]!);
+    assert.equal(stored.meta.mime, mime);
+    assert.equal(stored.meta.name, "resume.docx");
+    assert.deepEqual(stored.data, bytes);
+    const args = {
+      draft_id: draft.id,
+      digest: draft.digest,
+      chat_name: f.a.name,
+      text: "",
+      attachment_names: ["resume.docx"],
+    };
+    assert.equal(
+      (
+        await client.callTool({
+          name: "send_draft",
+          arguments: { ...args, attachment_names: [] },
+        })
+      ).isError,
+      true,
+    );
+    assert.equal(sends, 0);
+    assert.ok(
+      !(await client.callTool({ name: "send_draft", arguments: args })).isError,
+    );
+    assert.equal(f.store.draft(draft.id).providerId, "docx-provider-id");
+    await client.callTool({ name: "send_draft", arguments: args });
+    assert.equal(sends, 1);
+  } finally {
+    await client.close();
+    await server.close();
+    f.close();
+  }
+});
