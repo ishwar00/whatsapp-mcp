@@ -6,6 +6,10 @@ import {
   writeFileSync,
   readFileSync,
   mkdirSync,
+  symlinkSync,
+  existsSync,
+  realpathSync,
+  readdirSync,
 } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -15,7 +19,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Store, hash, opaque } from "../src/store.js";
 import { Service, type Sender } from "../src/service.js";
 import { WhatsApp } from "../src/whatsapp.js";
-import { createMcp, readInput } from "../src/mcp.js";
+import { createMcp, readInput, writeDownload } from "../src/mcp.js";
 import { type Message, type Draft } from "../src/domain.js";
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "wa-surface-")),
@@ -336,6 +340,7 @@ test("file_path sends DOCX/PDF/ZIP through actual provider path with exact bytes
       await svc.send(f.p, args);
     }
     assert.equal(calls, 3);
+    writeFileSync(join(f.dir, "bad.exe"), "unsupported");
     for (const [file, code] of [
       [join(f.dir, "missing.pdf"), "file_unavailable"],
       [join(f.dir, "bad.exe"), "unsupported_file_type"],
@@ -365,9 +370,9 @@ test("file_path sends DOCX/PDF/ZIP through actual provider path with exact bytes
     await f.close();
   }
 });
-test("attachment writes exact bytes, hash, suffix, explicit path and bounded original image without base64 text", async () => {
+test("attachment writes exact bytes and hash to Downloads and returns bounded original images", async () => {
   const f = fixture();
-  const defaultDir = join(f.dir, "downloads"); // explicit paths avoid touching the user Downloads
+  const paths: string[] = [];
   try {
     await f.connect();
     const bytes = Buffer.from("a PDF");
@@ -376,7 +381,7 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
         id: "file",
         chatId: f.chat.id,
         messageId: null,
-        name: "test.pdf",
+        name: f.store.uuid("download") + ".pdf",
         mime: "application/pdf",
         size: 0,
         digest: null,
@@ -384,19 +389,13 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
       },
       bytes,
     );
-    const dest = join(defaultDir, "test.pdf");
     const r = await f.call("get_attachment", {
       attachment_id: "file",
-      save_to: dest,
     });
+    paths.push(r.path);
     assert.deepEqual(readFileSync(r.path), bytes);
     assert.equal(r.sha256, createHash("sha256").update(bytes).digest("hex"));
     assert.ok(!JSON.stringify(r).includes(bytes.toString("base64")));
-    assert.equal(
-      (await f.call("get_attachment", { attachment_id: "file", save_to: dest }))
-        .code,
-      "file_unavailable",
-    );
     const image = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jR1kAAAAASUVORK5CYII=",
       "base64",
@@ -406,7 +405,7 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
         id: "img",
         chatId: f.chat.id,
         messageId: null,
-        name: "pixel.png",
+        name: f.store.uuid("pixel") + ".png",
         mime: "image/png",
         size: 0,
         digest: null,
@@ -416,10 +415,12 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
     );
     const result = await f.raw("get_attachment", {
       attachment_id: "img",
-      save_to: join(defaultDir, "pixel.png"),
       view: true,
     });
     assert.ok(Array.isArray(result.content));
+    const file = result.content.find((c) => c.type === "text");
+    assert.ok(file?.type === "text");
+    paths.push(JSON.parse(file.text).path);
     assert.deepEqual(
       result.content.find((c) => c.type === "image"),
       { type: "image", mimeType: "image/png", data: image.toString("base64") },
@@ -429,7 +430,7 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
         id: "large",
         chatId: f.chat.id,
         messageId: null,
-        name: "large.png",
+        name: f.store.uuid("large") + ".png",
         mime: "image/png",
         size: 0,
         digest: null,
@@ -439,11 +440,12 @@ test("attachment writes exact bytes, hash, suffix, explicit path and bounded ori
     );
     const large = await f.call("get_attachment", {
       attachment_id: "large",
-      save_to: join(defaultDir, "large.png"),
       view: true,
     });
+    paths.push(large.path);
     assert.equal(large.view_skipped, "too_large");
   } finally {
+    for (const path of paths) rmSync(path, { force: true });
     await f.close();
   }
 });
@@ -690,6 +692,149 @@ test("startup repairs previously aliased name rows before indexed lookups and is
         reopened.close();
       }
     }
+  } finally {
+    await f.close();
+  }
+});
+
+test("get_attachment rejects unknown save_to instead of accepting a caller-chosen destination", async () => {
+  const f = fixture();
+  try {
+    await f.connect();
+    f.store.attachments.save(
+      {
+        id: "reject-path",
+        chatId: f.chat.id,
+        messageId: null,
+        name: "file.txt",
+        mime: "text/plain",
+        size: 0,
+        digest: null,
+        availability: "pending",
+      },
+      Buffer.from("file"),
+    );
+    const destination = join(f.dir, "attacker.plist");
+    const tool = (await f.client.listTools()).tools.find(
+      (t) => t.name === "get_attachment",
+    )!;
+    assert.ok(!("save_to" in tool.inputSchema.properties!));
+    const result = await f.raw("get_attachment", {
+      attachment_id: "reject-path",
+      save_to: destination,
+    });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result), /save_to/);
+    assert.match(JSON.stringify(result), /Unrecognized|unrecognized|unknown/);
+    assert.equal(existsSync(destination), false);
+  } finally {
+    await f.close();
+  }
+});
+test("download names cannot traverse outside the resolved WhatsApp download directory", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wa-safe-download-"));
+  try {
+    const downloads = join(dir, "Downloads"),
+      path = writeDownload("../../x", Buffer.from("bytes"), downloads);
+    assert.equal(path, join(realpathSync(downloads), "whatsapp", "x"));
+    assert.equal(readFileSync(path, "utf8"), "bytes");
+    assert.equal(existsSync(join(dir, "x")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("download root symlink escaping Downloads is refused before writing any bytes", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wa-download-link-"));
+  try {
+    const downloads = join(dir, "Downloads"),
+      outside = join(dir, "outside");
+    mkdirSync(downloads);
+    mkdirSync(outside);
+    symlinkSync(outside, join(downloads, "whatsapp"));
+    assert.throws(
+      () => writeDownload("x.plist", Buffer.from("bytes"), downloads),
+      /must stay inside Downloads/,
+    );
+    assert.deepEqual(readdirSync(outside), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("download root symlink staying inside Downloads is allowed and returns its real path", () => {
+  const dir = mkdtempSync(join(tmpdir(), "wa-download-inside-"));
+  try {
+    const downloads = join(dir, "Downloads"),
+      inside = join(downloads, "folder");
+    mkdirSync(inside, { recursive: true });
+    symlinkSync(inside, join(downloads, "whatsapp"));
+    const path = writeDownload("x.pdf", Buffer.from("bytes"), downloads);
+    assert.equal(path, join(realpathSync(inside), "x.pdf"));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test("send resolves symlinks before hidden-path and extension checks, preserving only the original filename", async () => {
+  const f = fixture();
+  let sends = 0;
+  try {
+    const hidden = join(f.dir, ".config");
+    mkdirSync(hidden);
+    writeFileSync(join(hidden, "secret.txt"), "secret");
+    const alias = join(f.dir, "x.pdf");
+    symlinkSync(join(hidden, "secret.txt"), alias);
+    const dotfile = join(f.dir, ".receipt.pdf");
+    writeFileSync(dotfile, "secret");
+    f.sender.send = async (d) => {
+      sends++;
+      const file = f.store.attachments.read(d.input.attachment_ids[0]!);
+      assert.equal(file.meta.name, "original.pdf");
+      assert.equal(file.meta.mime, "text/plain");
+      assert.equal(file.data.toString(), "visible text");
+      return "fixture-send";
+    };
+    for (const path of [alias, dotfile])
+      await assert.rejects(
+        f.service.send(f.p, {
+          chat_id: f.chat.id,
+          to: "ragavendra",
+          file_path: path,
+          request_id: path,
+        }),
+        (e) =>
+          e instanceof Error && "code" in e && e.code === "file_unavailable",
+      );
+    assert.equal(sends, 0);
+    const executable = join(f.dir, "actual.exe"),
+      disguised = join(f.dir, "disguised.pdf");
+    writeFileSync(executable, "unsupported");
+    symlinkSync(executable, disguised);
+    await assert.rejects(
+      f.service.send(f.p, {
+        chat_id: f.chat.id,
+        to: "ragavendra",
+        file_path: disguised,
+        request_id: "disguised",
+      }),
+      (e) =>
+        e instanceof Error && "code" in e && e.code === "unsupported_file_type",
+    );
+    assert.equal(sends, 0);
+    const visible = join(f.dir, "actual.txt"),
+      original = join(f.dir, "original.pdf");
+    writeFileSync(visible, "visible text");
+    symlinkSync(visible, original);
+    assert.equal(
+      (
+        await f.service.send(f.p, {
+          chat_id: f.chat.id,
+          to: "ragavendra",
+          file_path: original,
+          request_id: "visible",
+        })
+      ).status,
+      "accepted",
+    );
+    assert.equal(sends, 1);
   } finally {
     await f.close();
   }

@@ -98,9 +98,9 @@ Send a message with a readable recipient and a unique request ID:
 {"chat_id":"chat_...","to":"Samyak","text":"can you check this?","request_id":"dns-followup-1"}
 ```
 
-For a file, supply an absolute `file_path`; `text` becomes the caption. PNG, JPEG, PDF, ZIP, TXT and DOCX are supported, up to 5 MiB. Reusing the same request ID and payload returns its recorded outcome without sending again. `accepted` means WhatsApp accepted the send, not that it was delivered. For an `unknown` outcome, inspect WhatsApp before sending a replacement.
+For a file, supply an absolute `file_path`; `text` becomes the caption. PNG, JPEG, PDF, ZIP, TXT and DOCX are supported, up to 5 MiB. File checks use the resolved path; hidden files and directories are refused. Reusing the same request ID and payload returns its recorded outcome without sending again. `accepted` means WhatsApp accepted the send, not that it was delivered. For an `unknown` outcome, inspect WhatsApp before sending a replacement.
 
-Attachments download to `~/Downloads/whatsapp/` by default, or an absolute `save_to`. Files are never returned as base64 text. `view:true` includes the original image only when it is at most 1 MB.
+Attachments always download to `~/Downloads/whatsapp/`; a symlink escaping Downloads is refused. Files are never returned as base64 text. `view:true` includes the original image only when it is at most 1 MB.
 
 To load older conversation, call `sync_history` with `chat_id` and optionally `before_message_id` and `max_batches`. If `done:false`, repeat the same arguments to wait on the shared job. Then issue a fresh `read_messages` query. WhatsApp decides how much history to provide; empty results and timeouts do not prove older messages are absent.
 

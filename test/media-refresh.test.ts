@@ -137,7 +137,7 @@ test("phone NOT_FOUND produces media_unavailable while preserving the message an
   try {
     const result = await client.callTool({
       name: "get_attachment",
-      arguments: { attachment_id: f.attachmentId, representation: "file" },
+      arguments: { attachment_id: f.attachmentId },
     });
     assert.equal(result.isError, true);
     assert.ok(Array.isArray(result.content));
