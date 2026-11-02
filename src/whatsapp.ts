@@ -157,6 +157,12 @@ export class WhatsApp implements Sender {
           savedName,
           profileName,
         });
+      for (const alias of [contact.name, contact.notify, contact.verifiedName])
+        if (alias)
+          this.store.rememberName(
+            opaque("chat", this.store.canonicalJid(jid)),
+            alias,
+          );
       if (!jid.endsWith("@g.us")) this.store.saveChat(jid, name);
     }
   }

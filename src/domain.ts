@@ -28,13 +28,13 @@ export const querySchema = z
     sent_at: z
       .object({
         from: z.string().datetime({ offset: true }),
-        to: z.string().datetime({ offset: true }),
+        to: z.string().datetime({ offset: true }).optional(),
       })
       .optional(),
     observed_at: z
       .object({
         from: z.string().datetime({ offset: true }),
-        to: z.string().datetime({ offset: true }),
+        to: z.string().datetime({ offset: true }).optional(),
       })
       .optional(),
     sender_ids: z.array(z.string()).max(50).optional(),
@@ -59,7 +59,7 @@ export const querySchema = z
       )
       .max(10)
       .optional(),
-    limit: z.number().int().min(1).max(100).default(50),
+    limit: z.number().int().min(1).max(100).default(30),
     order: z.enum(["oldest_first", "newest_first"]).default("newest_first"),
     page: z.string().optional(),
   })
@@ -123,7 +123,7 @@ export const clientSchema = z.object({
   name: z.string(),
   tokenHash: z.string(),
   canDraft: z.boolean(),
-  // Lets this key call send_draft. Off by default; the human gate is the MCP client's
+  // Lets this key call send. Off by default; the human gate is the MCP client's
   // permission prompt (see README "Send from the agent"), not this flag.
   canSend: z.boolean().default(false),
   enabled: z.boolean(),

@@ -71,6 +71,43 @@ export class Store {
       this.db.close();
       throw error;
     }
+    this.db.exec(
+      `CREATE TABLE IF NOT EXISTS chat_names(chat_id TEXT NOT NULL,name TEXT NOT NULL,first_seen_at TEXT NOT NULL,last_seen_at TEXT NOT NULL,PRIMARY KEY(chat_id,name));`,
+    );
+    if (!this.get("setting", "chat-names-backfilled")) {
+      for (const c of this.chats()) this.rememberName(c.id, c.name);
+      for (const raw of this.all("participant")) {
+        const p = z
+          .object({
+            id: z.string(),
+            jid: z.string(),
+            name: z.string().optional(),
+            savedName: z.string().optional(),
+            profileName: z.string().optional(),
+          })
+          .safeParse(raw);
+        if (p.success)
+          for (const name of [
+            p.data.name,
+            p.data.savedName,
+            p.data.profileName,
+          ])
+            if (name)
+              this.rememberName(
+                opaque("chat", this.canonicalJid(p.data.jid)),
+                name,
+              );
+      }
+      for (const row of this.db
+        .prepare(
+          "SELECT DISTINCT json_extract(value,'$.senderId') id,json_extract(value,'$.senderName') name FROM messages",
+        )
+        .all()) {
+        if (typeof row.id === "string" && typeof row.name === "string")
+          this.rememberName(row.id.replace(/^participant_/, "chat_"), row.name);
+      }
+      this.put("setting", "chat-names-backfilled", true);
+    }
     this.db.function("contains_text", { deterministic: true }, (text, query) =>
       String(text ?? "")
         .toLocaleLowerCase()
@@ -334,7 +371,35 @@ export class Store {
       updatedAt: new Date().toISOString(),
     };
     this.put("chat", id, chat);
+    this.rememberName(id, chat.name);
     return chat;
+  }
+  rememberName(chatId: string, name: string) {
+    if (!name.trim()) return;
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        "INSERT INTO chat_names VALUES(?,?,?,?) ON CONFLICT(chat_id,name) DO UPDATE SET last_seen_at=excluded.last_seen_at",
+      )
+      .run(this.chatId(chatId), name.trim(), now, now);
+  }
+  names(chatId: string) {
+    const canonical = this.chatId(chatId);
+    return [
+      ...new Set(
+        this.db
+          .prepare(
+            "SELECT chat_id,name FROM chat_names ORDER BY last_seen_at DESC,name",
+          )
+          .all()
+          .filter(
+            (r) =>
+              typeof r.chat_id === "string" &&
+              this.chatId(r.chat_id) === canonical,
+          )
+          .map((r) => z.string().parse(r.name)),
+      ),
+    ];
   }
   clients() {
     return this.all("client").map((v) => clientSchema.parse(v));
@@ -526,12 +591,10 @@ export class Store {
       ["sent", q.sent_at],
       ["observed", q.observed_at],
     ] as const) {
-      if (range)
-        add(
-          `julianday(${column})>=julianday(?) AND julianday(${column})<julianday(?)`,
-          range.from,
-          range.to,
-        );
+      if (range) {
+        add(`julianday(${column})>=julianday(?)`, range.from);
+        if (range.to) add(`julianday(${column})<julianday(?)`, range.to);
+      }
     }
     if (q.sender_ids) where.push(list(field("senderId"), expand(q.sender_ids)));
     if (q.direction) add(`${field("direction")}=?`, q.direction);
@@ -679,6 +742,10 @@ export class Store {
       }
     }
     this.writeMessage(message);
+    this.rememberName(
+      message.senderId.replace(/^participant_/, "chat_"),
+      message.senderName,
+    );
     const chat = this.get("chat", message.chatId);
     if (chat) {
       const jid = chatSchema.parse(chat).jid;
