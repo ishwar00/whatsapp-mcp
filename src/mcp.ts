@@ -120,7 +120,7 @@ export function createMcp(
         chat_id: z.string().optional(),
         query: z.string().optional(),
         type: z.enum(["direct", "group"]).optional(),
-        limit: z.number().int().min(1).max(100).default(20),
+        limit: z.number().int().min(1).max(100).optional(),
       })
       .strict(),
     (args) => {
@@ -130,6 +130,11 @@ export function createMcp(
         .parse(args);
       const { chat_id, ...filters } = q;
       if (chat_id) {
+        if (Object.keys(filters).length)
+          throw new BridgeError(
+            "invalid_argument",
+            "chat_id cannot be combined with query, type or limit",
+          );
         service.store.authorize(principal, chat_id);
         return { chats: [service.chatDetails(chat_id)] };
       }
@@ -169,7 +174,7 @@ export function createMcp(
           q.after ?? 10,
         );
         return {
-          messages: result.messages.map((m) => service.compact(m)),
+          messages: service.compactMessages(result.messages),
           ...(q.chat_ids
             ? {
                 chat_coverage: q.chat_ids.map((id) =>
@@ -189,7 +194,7 @@ export function createMcp(
       const { chat_coverage, ...safe } = result;
       return {
         ...safe,
-        messages: result.messages.map((m) => service.compact(m)),
+        messages: service.compactMessages(result.messages),
         ...(q.chat_ids ? { chat_coverage } : {}),
       };
     },

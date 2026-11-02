@@ -524,3 +524,168 @@ test("recoverable names backfill once and survive identity merges and restart", 
     await f.close();
   }
 });
+
+test("600-chat and 4600-name discovery completes under 500 ms with indexed name reads", async (t) => {
+  const f = fixture();
+  try {
+    f.store.transaction(() => {
+      for (let i = 0; i < 599; i++) {
+        const chat = f.store.saveChat(
+          `${2000 + i}@s.whatsapp.net`,
+          `Person ${i}`,
+        );
+        for (let n = 0; n < 6; n++)
+          f.store.rememberName(chat.id, `Alias ${i} ${n}`);
+      }
+      for (let i = 0; i < 406; i++)
+        f.store.rememberName(f.chat.id, `Extra ${i}`);
+    });
+    assert.equal(f.store.chats().length, 600);
+    assert.equal(
+      f.store.db.prepare("SELECT count(*) n FROM chat_names").get()?.n,
+      4600,
+    );
+    const start = performance.now();
+    const results = f.service.listChats(f.p, { limit: 100 });
+    const elapsed = performance.now() - start;
+    t.diagnostic(`600 chats / 4600 names: ${elapsed.toFixed(1)} ms`);
+    assert.equal(results.length, 100);
+    assert.ok(elapsed < 500, `discovery took ${elapsed.toFixed(1)}ms`);
+  } finally {
+    await f.close();
+  }
+});
+test("name rows rekey on verified identity merge and preserve first/last observation bounds", async () => {
+  const f = fixture();
+  try {
+    const lid = "777@lid",
+      pn = "555@s.whatsapp.net";
+    const a = f.store.saveChat(lid, "Old Name"),
+      b = f.store.saveChat(pn, "New Name");
+    f.store.db
+      .prepare("INSERT INTO chat_names VALUES(?,?,?,?)")
+      .run(a.id, "Shared", "2026-01-01", "2026-02-01");
+    f.store.db
+      .prepare("INSERT INTO chat_names VALUES(?,?,?,?)")
+      .run(b.id, "Shared", "2026-01-02", "2026-03-01");
+    f.store.addAlias(lid, pn);
+    assert.deepEqual(
+      f.store.db.prepare("SELECT * FROM chat_names WHERE chat_id=?").all(a.id),
+      [],
+    );
+    assert.deepEqual(f.store.names(a.id), f.store.names(b.id));
+    assert.ok(f.store.names(b.id).includes("Old Name"));
+    const shared = f.store.db
+      .prepare(
+        "SELECT first_seen_at,last_seen_at FROM chat_names WHERE chat_id=? AND name=?",
+      )
+      .get(b.id, "Shared");
+    assert.equal(shared?.first_seen_at, "2026-01-01");
+    assert.equal(shared?.last_seen_at, "2026-03-01");
+  } finally {
+    await f.close();
+  }
+});
+test("chat details reject list filters, match list aliases and expose only observed participant identity fields", async () => {
+  const f = fixture();
+  try {
+    f.message("sender");
+    f.wa.saveContact({
+      id: f.chat.jid,
+      name: "Saved Contact",
+      notify: "Push Alias",
+    });
+    f.store.saveChat(f.chat.jid, "Current Subject");
+    await f.connect();
+    for (const filter of [{ query: "x" }, { type: "direct" }, { limit: 20 }])
+      assert.equal(
+        (await f.call("list_chats", { chat_id: f.chat.id, ...filter })).code,
+        "invalid_argument",
+      );
+    const detail = (await f.call("list_chats", { chat_id: f.chat.id }))
+        .chats[0],
+      listing = (await f.call("list_chats")).chats[0];
+    assert.deepEqual(detail.aliases, listing.aliases);
+    assert.ok(detail.aliases.includes("Current Subject"));
+    assert.deepEqual(
+      Object.keys(detail.participants[0]).sort(),
+      ["participant_id", "name", "aliases"].sort(),
+    );
+  } finally {
+    await f.close();
+  }
+});
+test("read_messages scans accepted send/legacy records once per page and once per context read", async () => {
+  const f = fixture();
+  try {
+    for (let i = 0; i < 10; i++)
+      f.message("m" + i, {
+        direction: "outgoing",
+        providerId: "provider-" + i,
+      });
+    f.store.put("send", "sent", {
+      status: "accepted",
+      providerId: "provider-1",
+      chat_id: f.chat.id,
+    });
+    f.store.put("draft", "old", {
+      status: "accepted",
+      providerId: "provider-2",
+      input: { chat_id: f.chat.id },
+    });
+    await f.connect();
+    const all = f.store.all.bind(f.store);
+    let sendReads = 0,
+      draftReads = 0;
+    f.store.all = (kind) => {
+      if (kind === "send") sendReads++;
+      if (kind === "draft") draftReads++;
+      return all(kind);
+    };
+    const page = await f.call("read_messages", { chat_ids: [f.chat.id] });
+    assert.equal(
+      page.messages.filter((m: { sent_via_mcp?: boolean }) => m.sent_via_mcp)
+        .length,
+      2,
+    );
+    assert.equal(sendReads, 1);
+    assert.equal(draftReads, 1);
+    await f.call("read_messages", { around_message_id: "m5" });
+    assert.equal(sendReads, 2);
+    assert.equal(draftReads, 2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("startup repairs previously aliased name rows before indexed lookups and is repeatable", async () => {
+  const f = fixture();
+  try {
+    const lid = "777@lid",
+      pn = "555@s.whatsapp.net";
+    const a = f.store.saveChat(lid, "Legacy Alias"),
+      b = f.store.saveChat(pn, "Canonical");
+    f.store.addAlias(lid, pn);
+    f.store.db
+      .prepare("UPDATE chat_names SET chat_id=? WHERE chat_id=? AND name=?")
+      .run(a.id, b.id, "Legacy Alias");
+    f.store.remove("setting", "chat-names-canonical");
+    f.store.close();
+    for (let i = 0; i < 2; i++) {
+      const reopened = new Store(f.dir);
+      try {
+        assert.ok(reopened.names(b.id).includes("Legacy Alias"));
+        assert.equal(
+          reopened.db
+            .prepare("SELECT count(*) n FROM chat_names WHERE chat_id=?")
+            .get(a.id)?.n,
+          0,
+        );
+      } finally {
+        reopened.close();
+      }
+    }
+  } finally {
+    await f.close();
+  }
+});

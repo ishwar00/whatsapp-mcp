@@ -150,10 +150,6 @@ test("watch requires a usable target, group intent, sender scope and enforces pe
     const w = f.watch({ from_participant_ids: ["allowed"] });
     f.message("ignored");
     f.message("reaction", { senderId: "allowed", contentType: "reaction" });
-    f.message("edited", {
-      senderId: "allowed",
-      editedAt: new Date(f.now()).toISOString(),
-    });
     await f.tick();
     f.advance(10000);
     await f.tick();
@@ -209,9 +205,9 @@ test("group relevance calls isolate a bounded batch, discard invented IDs, skip 
     await f.tick();
     assert.equal(f.notices.length, 2);
     const row = f.store.db
-      .prepare("SELECT target FROM watches WHERE id=?")
+      .prepare("SELECT target,calls FROM watches WHERE id=?")
       .get(w.watch_id)!;
-    assert.equal(JSON.parse(String(row.target)).calls, 3);
+    assert.equal(row.calls, 3);
   } finally {
     await f.close();
   }
@@ -230,14 +226,12 @@ test("quoted outgoing replies, owner mentions and sender filter bypass group rel
     assert.equal(f.notices.length, 1);
     assert.match(f.notices[0], /2 new/);
     let row = f.store.db
-      .prepare("SELECT target FROM watches WHERE id=?")
+      .prepare("SELECT target,calls FROM watches WHERE id=?")
       .get(w.watch_id)!;
-    assert.equal(JSON.parse(String(row.target)).calls, 0);
-    const t = JSON.parse(String(row.target));
-    t.calls = 50;
+    assert.equal(row.calls, 0);
     f.store.db
-      .prepare("UPDATE watches SET target=? WHERE id=?")
-      .run(JSON.stringify(t), w.watch_id);
+      .prepare("UPDATE watches SET calls=50 WHERE id=?")
+      .run(w.watch_id);
     f.advance(1000);
     f.message("budget");
     await f.tick();
@@ -245,9 +239,9 @@ test("quoted outgoing replies, owner mentions and sender filter bypass group rel
     await f.tick();
     assert.equal(f.notices.length, 2);
     row = f.store.db
-      .prepare("SELECT target FROM watches WHERE id=?")
+      .prepare("SELECT target,calls FROM watches WHERE id=?")
       .get(w.watch_id)!;
-    assert.equal(JSON.parse(String(row.target)).calls, 50);
+    assert.equal(row.calls, 50);
   } finally {
     await f.close();
   }
@@ -359,7 +353,6 @@ test("native Claude delivery writes exactly auth and user JSON lines to a Unix s
         socket,
         token: "fixture-token",
         session_id: thread,
-        calls: 0,
       },
       "pointer",
       AbortSignal.timeout(3000),
@@ -393,7 +386,7 @@ test("Codex delivery finds a fake executable on PATH and forwards thread/message
   try {
     process.env.PATH = dir;
     await deliver(
-      { kind: "codex", thread_id: thread, calls: 0 },
+      { kind: "codex", thread_id: thread },
       "$(echo data) `literal`",
       AbortSignal.timeout(3000),
     );
@@ -425,6 +418,176 @@ test("batches over thirty retain same-second messages for the next notice", asyn
     assert.equal(f.notices.length, 2);
     assert.match(f.notices[1], /1 new/);
   } finally {
+    await f.close();
+  }
+});
+
+test("edited replies before registration and within the quiet window notify once, later edits do not retrigger", async () => {
+  const f = fixture();
+  try {
+    f.message("out", { direction: "outgoing" });
+    f.advance(1000);
+    const a = f.message("a");
+    f.store.saveMessage({
+      ...a,
+      text: "fixed typo",
+      editedAt: new Date(f.now()).toISOString(),
+    });
+    f.watch();
+    await f.tick();
+    f.advance(3000);
+    const b = f.message("b");
+    await f.tick();
+    f.advance(3000);
+    f.store.saveMessage({
+      ...b,
+      text: "also fixed",
+      editedAt: new Date(f.now()).toISOString(),
+    });
+    await f.tick();
+    f.advance(7000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+    assert.match(f.notices[0], /2 new/);
+    f.store.saveMessage({
+      ...b,
+      text: "later edit",
+      editedAt: new Date(f.now()).toISOString(),
+    });
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+test("since offsets and omitted milliseconds normalize to the same UTC window and reject invalid timestamps", async () => {
+  const f = fixture();
+  try {
+    f.message("before", { sentAt: "2026-11-02T09:59:59.999Z" });
+    f.message("equal", { sentAt: "2026-11-02T10:00:00.000Z" });
+    for (const since of ["2026-11-02T15:30:00+05:30", "2026-11-02T10:00:00Z"]) {
+      const w = f.watch({ since });
+      assert.equal(w.since, "2026-11-02T10:00:00.000Z");
+    }
+    assert.throws(() => f.watch({ since: "not-a-date" }));
+    assert.throws(() => f.watch({ since: "2026-02-30T10:00:00Z" }));
+    await f.tick();
+    f.advance(10000);
+    await f.tick();
+    assert.equal(f.notices.length, 2);
+    for (const notice of f.notices) assert.match(notice, /1 new/);
+  } finally {
+    await f.close();
+  }
+});
+test("intent and relevance budget live in watch columns, not targets or leaked objects", async () => {
+  const f = fixture(true);
+  try {
+    const w = f.watch();
+    const row = f.store.db
+      .prepare("SELECT waiting_for,calls,target FROM watches WHERE id=?")
+      .get(w.watch_id)!;
+    assert.equal(row.waiting_for, "DNS records");
+    assert.equal(row.calls, 0);
+    assert.ok(!("calls" in JSON.parse(String(row.target))));
+    assert.equal(f.store.all("watch-intent").length, 0);
+    f.watches.unwatch(f.p, w.watch_id);
+    assert.equal(f.store.all("watch-intent").length, 0);
+  } finally {
+    await f.close();
+  }
+});
+test("non-delivery processing errors preserve active watch and retry next tick", async () => {
+  const f = fixture();
+  const chat = f.store.chat.bind(f.store);
+  try {
+    const w = f.watch();
+    f.message("a");
+    await f.tick();
+    f.advance(10000);
+    let fail = true;
+    f.store.chat = (id) => {
+      if (fail) {
+        fail = false;
+        throw Error("synthetic processing error");
+      }
+      return chat(id);
+    };
+    await f.tick();
+    assert.equal(
+      f.store.db.prepare("SELECT state FROM watches WHERE id=?").get(w.watch_id)
+        ?.state,
+      "active",
+    );
+    assert.equal(f.notices.length, 0);
+    await f.tick();
+    assert.equal(f.notices.length, 1);
+  } finally {
+    f.store.chat = chat;
+    await f.close();
+  }
+});
+test("unwatch preserves expired and undeliverable terminal states and stays idempotent", async () => {
+  const f = fixture();
+  try {
+    for (const state of ["expired", "undeliverable"]) {
+      const w = f.watch();
+      f.store.db
+        .prepare("UPDATE watches SET state=?,target=NULL WHERE id=?")
+        .run(state, w.watch_id);
+      assert.equal(f.watches.unwatch(f.p, w.watch_id).state, state);
+      assert.equal(f.watches.unwatch(f.p, w.watch_id).state, state);
+      assert.equal(
+        f.store.db
+          .prepare("SELECT state FROM watches WHERE id=?")
+          .get(w.watch_id)?.state,
+        state,
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("existing watch rows migrate intent and calls out of legacy storage atomically and repeatably", async () => {
+  const f = fixture(true);
+  let upgraded: Watches | undefined;
+  try {
+    const w = f.watch();
+    await f.watches.close();
+    const target = JSON.parse(
+      String(
+        f.store.db
+          .prepare("SELECT target FROM watches WHERE id=?")
+          .get(w.watch_id)?.target,
+      ),
+    );
+    f.store.db
+      .prepare("UPDATE watches SET target=? WHERE id=?")
+      .run(JSON.stringify({ ...target, calls: 7 }), w.watch_id);
+    f.store.put("watch-intent", w.watch_id, "legacy waiting intent");
+    f.store.db.exec(
+      "ALTER TABLE watches DROP COLUMN waiting_for; ALTER TABLE watches DROP COLUMN calls",
+    );
+    upgraded = new Watches(f.store, f.sender, f.config, { now: f.now });
+    let row = f.store.db
+      .prepare("SELECT waiting_for,calls,target FROM watches WHERE id=?")
+      .get(w.watch_id)!;
+    assert.equal(row.waiting_for, "legacy waiting intent");
+    assert.equal(row.calls, 7);
+    assert.ok(!("calls" in JSON.parse(String(row.target))));
+    assert.equal(f.store.all("watch-intent").length, 0);
+    await upgraded.close();
+    upgraded = new Watches(f.store, f.sender, f.config, { now: f.now });
+    row = f.store.db
+      .prepare("SELECT waiting_for,calls FROM watches WHERE id=?")
+      .get(w.watch_id)!;
+    assert.equal(row.waiting_for, "legacy waiting intent");
+    assert.equal(row.calls, 7);
+  } finally {
+    await upgraded?.close();
     await f.close();
   }
 });

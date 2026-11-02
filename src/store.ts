@@ -108,6 +108,18 @@ export class Store {
       }
       this.put("setting", "chat-names-backfilled", true);
     }
+    if (!this.get("setting", "chat-names-canonical")) {
+      this.transaction(() => {
+        for (const row of this.db
+          .prepare("SELECT DISTINCT chat_id FROM chat_names")
+          .all()) {
+          const from = z.string().parse(row.chat_id),
+            to = this.chatId(from);
+          if (from !== to) this.mergeNames(from, to);
+        }
+        this.put("setting", "chat-names-canonical", true);
+      });
+    }
     this.db.function("contains_text", { deterministic: true }, (text, query) =>
       String(text ?? "")
         .toLocaleLowerCase()
@@ -246,6 +258,7 @@ export class Store {
         });
       }
       this.put("chat-alias", from, to);
+      this.mergeNames(from, to);
       const lidSender = opaque("participant", lid),
         pnSender = opaque("participant", pn);
       const oldParticipant = this.get("participant", lidSender);
@@ -383,23 +396,25 @@ export class Store {
       )
       .run(this.chatId(chatId), name.trim(), now, now);
   }
+  private mergeNames(from: string, to: string) {
+    this.db
+      .prepare(
+        `INSERT INTO chat_names(chat_id,name,first_seen_at,last_seen_at)
+      SELECT ?,name,first_seen_at,last_seen_at FROM chat_names WHERE chat_id=?
+      ON CONFLICT(chat_id,name) DO UPDATE SET
+      first_seen_at=min(chat_names.first_seen_at,excluded.first_seen_at),
+      last_seen_at=max(chat_names.last_seen_at,excluded.last_seen_at)`,
+      )
+      .run(to, from);
+    this.db.prepare("DELETE FROM chat_names WHERE chat_id=?").run(from);
+  }
   names(chatId: string) {
-    const canonical = this.chatId(chatId);
-    return [
-      ...new Set(
-        this.db
-          .prepare(
-            "SELECT chat_id,name FROM chat_names ORDER BY last_seen_at DESC,name",
-          )
-          .all()
-          .filter(
-            (r) =>
-              typeof r.chat_id === "string" &&
-              this.chatId(r.chat_id) === canonical,
-          )
-          .map((r) => z.string().parse(r.name)),
-      ),
-    ];
+    return this.db
+      .prepare(
+        "SELECT name FROM chat_names WHERE chat_id=? ORDER BY last_seen_at DESC,name",
+      )
+      .all(this.chatId(chatId))
+      .map((r) => z.string().parse(r.name));
   }
   clients() {
     return this.all("client").map((v) => clientSchema.parse(v));

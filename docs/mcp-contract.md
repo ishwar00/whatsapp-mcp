@@ -12,7 +12,7 @@ Arguments: `query?`, `type?: direct|group`, `limit?:1–100` (20), `chat_id?`.
 
 Each result has `chat_id`, `name`, `aliases`, `type`, `message_count` and nullable `last_message_at`. Query matches names and aliases without case, accents, punctuation or emoji. Results sort by newest activity, with empty chats last.
 
-With `chat_id`, returns that chat plus observed `participants`: `participant_id`, `name`, `aliases`. Only recoverable current and stored names can be backfilled; future names are retained. Names alone never merge identities.
+`chat_id` cannot be combined with query, type or limit. With `chat_id`, returns that chat plus observed `participants`: `participant_id`, `name`, `aliases`. Only recoverable current and stored names can be backfilled; future names are retained. Names alone never merge identities.
 
 ## read_messages
 

@@ -19,7 +19,14 @@ export const watchInput = z
     chat_id: z.string(),
     waiting_for: z.string().max(500).optional(),
     from_participant_ids: z.array(z.string()).max(50).default([]),
-    since: z.string().datetime({ offset: true }).optional(),
+    since: z
+      .string()
+      .datetime({ offset: true })
+      .refine(
+        (value) => Number.isFinite(Date.parse(value)),
+        "Invalid since timestamp",
+      )
+      .optional(),
     timeout_seconds: z.number().int().min(1).max(604800).default(86400),
     codex_thread_id: z.string().uuid().optional(),
   })
@@ -34,12 +41,10 @@ export const callerSchema = z
 const targetSchema = z.discriminatedUnion("kind", [
   callerSchema.extend({
     kind: z.literal("claude"),
-    calls: z.number().default(0),
   }),
   z.object({
     kind: z.literal("codex"),
     thread_id: z.string().uuid(),
-    calls: z.number().default(0),
   }),
 ]);
 const rowSchema = z.object({
@@ -54,6 +59,8 @@ const rowSchema = z.object({
   last_notified_sent_at: z.string().nullable(),
   state: z.enum(["active", "expired", "cancelled", "undeliverable"]),
   created_at: z.string(),
+  waiting_for: z.string(),
+  calls: z.number().int().min(0),
 });
 type Row = z.infer<typeof rowSchema>;
 type Target = z.infer<typeof targetSchema>;
@@ -127,8 +134,45 @@ export class Watches {
     } = {},
   ) {
     store.db.exec(
-      "CREATE TABLE IF NOT EXISTS watches(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,chat_id TEXT NOT NULL,from_ids TEXT NOT NULL,since TEXT NOT NULL,expires_at TEXT NOT NULL,target_kind TEXT NOT NULL,target TEXT,last_notified_sent_at TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS watches(id TEXT PRIMARY KEY,key_id TEXT NOT NULL,chat_id TEXT NOT NULL,from_ids TEXT NOT NULL,since TEXT NOT NULL,expires_at TEXT NOT NULL,target_kind TEXT NOT NULL,target TEXT,last_notified_sent_at TEXT,state TEXT NOT NULL,created_at TEXT NOT NULL,waiting_for TEXT NOT NULL DEFAULT '',calls INTEGER NOT NULL DEFAULT 0)",
     );
+    const columns = store.db
+      .prepare("PRAGMA table_info(watches)")
+      .all()
+      .map((r) => r.name);
+    if (!columns.includes("waiting_for")) {
+      store.transaction(() => {
+        store.db.exec(
+          "ALTER TABLE watches ADD COLUMN waiting_for TEXT NOT NULL DEFAULT ''; ALTER TABLE watches ADD COLUMN calls INTEGER NOT NULL DEFAULT 0",
+        );
+        for (const raw of store.db
+          .prepare("SELECT id,target FROM watches")
+          .all()) {
+          const id = z.string().parse(raw.id);
+          const target = raw.target
+            ? JSON.parse(z.string().parse(raw.target))
+            : null;
+          const calls =
+            z
+              .object({ calls: z.number().default(0) })
+              .nullable()
+              .parse(target)?.calls ?? 0;
+          const intent =
+            z.string().optional().parse(store.get("watch-intent", id)) ?? "";
+          store.db
+            .prepare(
+              "UPDATE watches SET waiting_for=?,calls=?,target=? WHERE id=?",
+            )
+            .run(
+              intent,
+              calls,
+              target ? JSON.stringify(targetSchema.parse(target)) : null,
+              id,
+            );
+        }
+        store.db.prepare("DELETE FROM objects WHERE kind='watch-intent'").run();
+      });
+    }
   }
   private now() {
     return this.options.now?.() ?? Date.now();
@@ -171,7 +215,7 @@ export class Watches {
       );
     let target: Target;
     if (q.codex_thread_id)
-      target = { kind: "codex", thread_id: q.codex_thread_id, calls: 0 };
+      target = { kind: "codex", thread_id: q.codex_thread_id };
     else {
       const parsed = callerSchema.safeParse(caller);
       if (!parsed.success)
@@ -179,7 +223,7 @@ export class Watches {
           "no_notify_target",
           "pass codex_thread_id, or call from a Claude Code session",
         );
-      target = { kind: "claude", ...parsed.data, calls: 0 };
+      target = { kind: "claude", ...parsed.data };
     }
     if (this.rows().filter((w) => w.key_id === p.id).length >= 20)
       throw new BridgeError("busy", "At most 20 active watches per key");
@@ -199,17 +243,19 @@ export class Watches {
       key_id: p.id,
       chat_id: chat.id,
       from_ids: JSON.stringify(q.from_participant_ids),
-      since: q.since ?? recent ?? new Date(now).toISOString(),
+      since: new Date(q.since ?? recent ?? now).toISOString(),
       expires_at: new Date(now + q.timeout_seconds * 1000).toISOString(),
       target_kind: target.kind,
       target: JSON.stringify(target),
       last_notified_sent_at: null,
       state: "active",
       created_at: new Date(now).toISOString(),
+      waiting_for: q.waiting_for ?? "",
+      calls: 0,
     };
     this.store.transaction(() => {
       this.store.db
-        .prepare("INSERT INTO watches VALUES(?,?,?,?,?,?,?,?,?,?,?)")
+        .prepare("INSERT INTO watches VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .run(
           w.id,
           w.key_id,
@@ -222,14 +268,17 @@ export class Watches {
           null,
           w.state,
           w.created_at,
+          w.waiting_for,
+          w.calls,
         );
-      this.store.put("watch-intent", w.id, q.waiting_for ?? "");
     });
     return this.public(w);
   }
   private end(id: string, state: Row["state"]) {
     this.store.db
-      .prepare("UPDATE watches SET state=?,target=NULL WHERE id=?")
+      .prepare(
+        "UPDATE watches SET state=?,target=NULL WHERE id=? AND state='active'",
+      )
       .run(state, id);
     this.jobs.get(id)?.controller.abort();
     this.batches.delete(id);
@@ -241,8 +290,12 @@ export class Watches {
       .prepare("SELECT * FROM watches WHERE id=? AND key_id=?")
       .get(id, p.id);
     if (!row) throw new BridgeError("not_found_or_not_permitted");
-    this.end(id, "cancelled");
-    return { watch_id: id, state: "cancelled" };
+    const current = rowSchema.parse(row);
+    if (current.state === "active") this.end(id, "cancelled");
+    return {
+      watch_id: id,
+      state: current.state === "active" ? "cancelled" : current.state,
+    };
   }
   start() {
     if (!this.timer)
@@ -274,7 +327,6 @@ export class Watches {
         (m) =>
           m.direction === "incoming" &&
           !m.deleted &&
-          !m.editedAt &&
           m.contentType !== "reaction" &&
           !seen.has(m.id) &&
           (!from.length ||
@@ -318,7 +370,9 @@ export class Watches {
       const controller = new AbortController();
       const promise = this.flush(w, messages, batch, controller.signal)
         .catch(() => {
-          this.end(w.id, "undeliverable");
+          process.stderr.write(
+            `Watch ${w.id}: processing failed; retrying next tick\n`,
+          );
         })
         .finally(() => this.jobs.delete(w.id));
       this.jobs.set(w.id, { controller, promise });
@@ -353,14 +407,12 @@ export class Watches {
       });
       if (remaining.length) {
         let relevant: string[];
-        if (target.calls >= 50) relevant = remaining.map((m) => m.id);
+        if (w.calls >= 50) relevant = remaining.map((m) => m.id);
         else {
-          target.calls++;
+          w.calls++;
           this.store.db
-            .prepare(
-              "UPDATE watches SET target=? WHERE id=? AND state='active'",
-            )
-            .run(JSON.stringify(target), w.id);
+            .prepare("UPDATE watches SET calls=? WHERE id=? AND state='active'")
+            .run(w.calls, w.id);
           const outgoing = this.store
             .messages([w.chat_id])
             .filter((m) => m.direction === "outgoing" && !m.deleted)
@@ -373,9 +425,7 @@ export class Watches {
             relevant = await relevantIds(
               this.classifier,
               {
-                waiting_for: z
-                  .string()
-                  .parse(this.store.get("watch-intent", w.id)),
+                waiting_for: w.waiting_for,
                 outgoing: outgoing?.text.slice(0, 2000) ?? "",
                 messages: remaining.map((m) => ({
                   id: m.id,
@@ -412,18 +462,21 @@ export class Watches {
         this.options.codex_executable,
       );
       if (signal.aborted) return;
-      this.store.db
-        .prepare(
-          "UPDATE watches SET last_notified_sent_at=? WHERE id=? AND state='active'",
-        )
-        .run(ready.through, w.id);
-      this.batches.delete(w.id);
     } catch {
+      if (signal.aborted) return;
       const wait = [5000, 30000, 120000][batch.attempt++];
       if (wait === undefined) this.end(w.id, "undeliverable");
       else batch.next = this.now() + wait;
+      return;
     }
+    this.store.db
+      .prepare(
+        "UPDATE watches SET last_notified_sent_at=? WHERE id=? AND state='active'",
+      )
+      .run(ready.through, w.id);
+    this.batches.delete(w.id);
   }
+
   async close() {
     this.closed = true;
     if (this.timer) clearInterval(this.timer);

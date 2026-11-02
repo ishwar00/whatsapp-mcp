@@ -219,7 +219,6 @@ export class Service {
             aliases: this.store
               .names(m.senderId.replace(/^participant_/, "chat_"))
               .filter((n) => n !== this.senderName(m)),
-            is_admin: null,
           },
         ]),
       ).values(),
@@ -227,7 +226,9 @@ export class Service {
     return {
       chat_id: chat.id,
       name,
-      aliases: this.store.names(chat.id).filter((n) => n !== name),
+      aliases: [...new Set([chat.name, ...this.store.names(chat.id)])].filter(
+        (n) => n !== name,
+      ),
       type: chat.type,
       message_count: coverage.stored_messages,
       last_message_at: coverage.newest_message_at,
@@ -246,29 +247,35 @@ export class Service {
       ? (p.data.savedName ?? p.data.name ?? m.senderName)
       : (this.store.names(id)[0] ?? m.senderName);
   }
-  compact(m: Message) {
+  private sentMessages() {
+    const sent = new Set<string>();
+    for (const v of [...this.store.all("send"), ...this.store.all("draft")]) {
+      const r = z
+        .object({
+          status: z.string(),
+          providerId: z.string().nullable().optional(),
+          chat_id: z.string().optional(),
+          input: z.object({ chat_id: z.string() }).optional(),
+        })
+        .safeParse(v);
+      if (r.success && r.data.status === "accepted" && r.data.providerId)
+        sent.add(
+          JSON.stringify([
+            this.store.chatId(r.data.chat_id ?? r.data.input?.chat_id ?? ""),
+            r.data.providerId,
+          ]),
+        );
+    }
+    return sent;
+  }
+  compactMessages(messages: Message[]) {
+    const sent = this.sentMessages();
+    return messages.map((m) => this.compact(m, sent));
+  }
+  compact(m: Message, sent = this.sentMessages()) {
     const attachment = m.attachmentId
       ? this.store.attachments.get(m.attachmentId)
       : undefined;
-    const sent = [...this.store.all("send"), ...this.store.all("draft")].some(
-      (v) => {
-        const r = z
-          .object({
-            status: z.string(),
-            providerId: z.string().nullable().optional(),
-            chat_id: z.string().optional(),
-            input: z.object({ chat_id: z.string() }).optional(),
-          })
-          .safeParse(v);
-        return (
-          r.success &&
-          r.data.status === "accepted" &&
-          r.data.providerId === m.providerId &&
-          this.store.chatId(r.data.chat_id ?? r.data.input?.chat_id ?? "") ===
-            this.store.chatId(m.chatId)
-        );
-      },
-    );
     return {
       id: m.id,
       chat_id: m.chatId,
@@ -291,7 +298,10 @@ export class Service {
             },
           }
         : {}),
-      ...(m.direction === "outgoing" && sent ? { sent_via_mcp: true } : {}),
+      ...(m.direction === "outgoing" &&
+      sent.has(JSON.stringify([this.store.chatId(m.chatId), m.providerId]))
+        ? { sent_via_mcp: true }
+        : {}),
     };
   }
   async send(p: Principal, input: unknown) {

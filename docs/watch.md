@@ -12,7 +12,7 @@ Optional `since` is an ISO timestamp. Without it, the watch starts at the latest
 
 Timeout defaults to 86400 seconds and cannot exceed 604800. The result contains `watch_id`, `chat_id`, `since`, `expires_at`, and a non-secret target label. `get_status` lists active watches; at most 20 may be active per key. `unwatch({watch_id})` ends one.
 
-Incoming replies coalesce until ten quiet seconds or sixty seconds from the start of a batch. Reactions, edits and deletions do not wake the agent. Every incoming DM counts. In groups, replies quoting your outgoing messages, mentions of you and explicitly selected senders count directly. Other group messages receive one relevance check per batch against `waiting_for` and your latest outgoing text.
+Incoming replies coalesce until ten quiet seconds or sixty seconds from the start of a batch. Reactions and deletions do not wake the agent. A reply edited before processing still counts; editing a processed reply does not send another notice. Every incoming DM counts. In groups, replies quoting your outgoing messages, mentions of you and explicitly selected senders count directly. Other group messages receive one relevance check per batch against `waiting_for` and your latest outgoing text.
 
 The relevance runner defaults to the locally authenticated Claude Code CLI with model `haiku`. It runs without tools or MCP, in a temporary directory without session persistence. Each call receives at most 30 messages with 2000 characters each. Failure or a 45-second timeout wakes the agent rather than hiding a potential reply. After 50 calls, all eligible messages count.
 
