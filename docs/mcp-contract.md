@@ -109,7 +109,9 @@ CLI isolation, batching, budgets, model-error behavior and delivery limitations.
 `create_draft` accepts `chat_id`, `text`, an optional `reply_to_message_id`,
 `mention_ids`, a `request_id`, and either one `attachment_id` in `attachment_ids`
 or an inline attachment with `name`, `mime_type`, and base64 `data`. Allowed inline
-MIME types are PNG, JPEG, PDF, ZIP, and text/plain. Maximum size is 5 MiB.
+MIME types are PNG, JPEG, PDF, ZIP, text/plain, and Word DOCX
+(`application/vnd.openxmlformats-officedocument.wordprocessingml.document`).
+Maximum size is 5 MiB.
 
 The result includes a draft ID, immutable digest and `attachment_names`.
 Reusing a request ID with different content returns `request_conflict`.

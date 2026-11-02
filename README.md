@@ -191,7 +191,7 @@ Both transports use the same service, keys, and tools. Require approval before
 Drafting sends nothing. Sending validates the key, recipient name, exact text,
 attachment filenames, digest, references, and draft state. Echo the exact
 `attachment_names` returned by `create_draft` so the approval shows the filenames.
-Each draft supports one image, PDF, text file, or ZIP up to **5 MiB**.
+Each draft supports one image, Word DOCX, PDF, text file, or ZIP up to **5 MiB**.
 
 Approval is **client-enforced**. The server does not independently prove a human
 approved the call. Use client permissions,
