@@ -14,7 +14,7 @@ flowchart TD
     R --> N[Native agent notice]
 ```
 
-`store.ts` owns message queries, verified identity reconciliation, retained names, erasure and attachment storage. `whatsapp.ts` translates provider events and authenticates encrypted edits. `history.ts` owns bounded on-demand retrieval. `service.ts` implements compact reads and idempotent sends; `mcp.ts` validates tool arguments and writes requested downloads to disk.
+`store.ts` owns message queries, verified identity reconciliation, retained names, erasure and attachment storage. `whatsapp.ts` translates provider events and authenticates encrypted edits. `history.ts` owns bounded on-demand retrieval. `service.ts` implements compact reads and idempotent sends; `mcp.ts` validates tool arguments and confines downloads to the resolved WhatsApp folder inside Downloads.
 
 Each send records an attempt before provider dispatch. The per-key request ID prevents a repeated or interrupted operation from sending twice. Human approval remains the client's permission rule on `send`.
 

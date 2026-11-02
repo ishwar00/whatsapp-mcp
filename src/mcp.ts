@@ -11,8 +11,8 @@ import { sendInput } from "./service.js";
 import type { WhatsApp } from "./whatsapp.js";
 import type { HistorySync } from "./history.js";
 import { watchInput } from "./watches.js";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, basename, extname, isAbsolute, join } from "node:path";
+import { mkdirSync, writeFileSync, realpathSync } from "node:fs";
+import { basename, extname, isAbsolute, join, relative, sep } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 export const readInput = querySchema
@@ -37,10 +37,55 @@ export const readInput = querySchema
 const fileInput = z
   .object({
     attachment_id: z.string(),
-    save_to: z.string().refine(isAbsolute).optional(),
     view: z.boolean().default(false),
   })
   .strict();
+export function writeDownload(
+  name: string,
+  data: Buffer,
+  downloads = join(homedir(), "Downloads"),
+) {
+  try {
+    mkdirSync(downloads, { recursive: true, mode: 0o700 });
+    const base = realpathSync(downloads),
+      requested = join(base, "whatsapp");
+    mkdirSync(requested, { recursive: true, mode: 0o700 });
+    const root = realpathSync(requested),
+      location = relative(base, root);
+    if (
+      location === ".." ||
+      location.startsWith(`..${sep}`) ||
+      isAbsolute(location)
+    )
+      throw new BridgeError(
+        "file_unavailable",
+        "WhatsApp download directory must stay inside Downloads",
+      );
+    const leaf = basename(name),
+      safe = leaf && leaf !== "." && leaf !== ".." ? leaf : "attachment";
+    const desired = join(root, safe),
+      ext = extname(desired);
+    for (let n = 1; ; n++) {
+      const path =
+        n === 1
+          ? desired
+          : desired.slice(0, desired.length - ext.length) + ` (${n})` + ext;
+      try {
+        writeFileSync(path, data, { flag: "wx", mode: 0o600 });
+        return path;
+      } catch (e) {
+        if (e instanceof Error && "code" in e && e.code === "EEXIST") continue;
+        throw e;
+      }
+    }
+  } catch (e) {
+    if (e instanceof BridgeError) throw e;
+    throw new BridgeError(
+      "file_unavailable",
+      "Attachment cannot be written to Downloads/whatsapp",
+    );
+  }
+}
 export function createMcp(
   service: Service,
   wa: Pick<WhatsApp, "download" | "state"> & {
@@ -203,8 +248,8 @@ export function createMcp(
     "get_attachment",
     {
       description:
-        "Save an attachment to disk. Returns path, name, MIME, size and SHA-256; never base64 text. Optional view returns a bounded image preview.",
-      inputSchema: fileInput.shape,
+        "Save an attachment inside ~/Downloads/whatsapp. Returns its path and metadata; optional view includes a small image, never base64 file text.",
+      inputSchema: fileInput,
       annotations: { readOnlyHint: true },
     },
     async (args) => {
@@ -217,33 +262,7 @@ export function createMcp(
         const { data } = service.store.attachments.read(meta.id);
         const leaf = basename(meta.name);
         const name = leaf && leaf !== "." && leaf !== ".." ? leaf : meta.id;
-        const desired =
-          q.save_to ?? join(homedir(), "Downloads", "whatsapp", name);
-        mkdirSync(dirname(desired), { recursive: true, mode: 0o700 });
-        let path = desired;
-        for (let n = 1; ; n++) {
-          if (!q.save_to && n > 1) {
-            const ext = extname(desired);
-            path =
-              desired.slice(0, desired.length - ext.length) + ` (${n})` + ext;
-          }
-          try {
-            writeFileSync(path, data, { flag: "wx", mode: 0o600 });
-            break;
-          } catch (e) {
-            if (
-              !q.save_to &&
-              e instanceof Error &&
-              "code" in e &&
-              e.code === "EEXIST"
-            )
-              continue;
-            throw new BridgeError(
-              "file_unavailable",
-              "Destination already exists or cannot be written",
-            );
-          }
-        }
+        const path = writeDownload(name, data);
         const result = json({
           path,
           name: meta.name,

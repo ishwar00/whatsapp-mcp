@@ -26,9 +26,9 @@ Messages contain `id`, `chat_id`, `sender_id`, `sender_name`, `direction`, `sent
 
 ## get_attachment
 
-Arguments: `attachment_id`, optional absolute `save_to`, `view?` (false).
+Arguments: `attachment_id`, `view?` (false).
 
-Writes to `save_to` or `~/Downloads/whatsapp/<name>`. Default collisions add ` (2)`, ` (3)` before the extension. An explicit existing destination is refused. Returns `path`, `name`, `mime`, `size`, `sha256`.
+Writes only to `~/Downloads/whatsapp/<basename>`. Collisions add ` (2)`, ` (3)` before the extension. The root is resolved to its real path; a symlink escaping Downloads is refused. Returns `path`, `name`, `mime`, `size`, `sha256`.
 
 For image MIME types, `view:true` also returns original MCP image content up to 1 MB. Larger images return `view_skipped:"too_large"`. No base64 file text is returned. Unavailable expired media is refreshed through the phone once; failure returns `media_unavailable` and preserves readable metadata.
 
@@ -36,7 +36,7 @@ For image MIME types, `view:true` also returns original MCP image content up to 
 
 Arguments: `chat_id`, readable `to`, `request_id`, optional `text`, absolute `file_path`, `reply_to_message_id`, `mention_ids`.
 
-Requires text or a file. `to` must match a normalized substring of the current name or a known alias. `recipient_mismatch` includes the actual chat name and sends nothing. A file's basename is sent as its filename, and text is its caption. Allowed extensions are png, jpg, jpeg, pdf, zip, txt, docx; maximum size 5 MiB.
+Requires text or a file. `to` must match a normalized substring of the current name or a known alias. `recipient_mismatch` includes the actual chat name and sends nothing. A file's basename is sent as its filename, and text is its caption. Allowed extensions are png, jpg, jpeg, pdf, zip, txt, docx; maximum size 5 MiB. The real file path determines its type and size; hidden path segments are refused. The original path determines the displayed filename.
 
 Returns `status: accepted|failed|unknown`, `chat_id`, `chat_name`, optional `message_id`, `sent_at`, `error`. Same request ID and payload returns the recorded outcome; a changed payload returns `request_conflict`. Interrupted or uncertain attempts are never retried automatically. Client permissions enforce human approval on this tool; the server cannot attest that a human approved.
 

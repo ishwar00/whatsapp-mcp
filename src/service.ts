@@ -7,8 +7,8 @@ import {
 } from "./domain.js";
 import { Store, hash } from "./store.js";
 import type { Watches } from "./watches.js";
-import { readFileSync, statSync } from "node:fs";
-import { basename, extname, isAbsolute } from "node:path";
+import { readFileSync, statSync, realpathSync } from "node:fs";
+import { basename, extname, isAbsolute, sep } from "node:path";
 import { type Message } from "./domain.js";
 export const normalizeName = (s: string) =>
   s
@@ -355,15 +355,22 @@ export class Service {
         throw new BridgeError("not_found_or_not_permitted");
     const attachmentIds: string[] = [];
     if (q.file_path) {
-      const mime = mimes[extname(q.file_path).toLowerCase()];
-      if (!mime) throw new BridgeError("unsupported_file_type");
-      let bytes: Buffer;
+      let bytes: Buffer, mime: string;
       try {
-        const stat = statSync(q.file_path);
+        const real = realpathSync(q.file_path);
+        if (real.split(sep).some((segment) => segment.startsWith(".")))
+          throw new BridgeError(
+            "file_unavailable",
+            "Hidden files and directories cannot be sent",
+          );
+        const resolvedMime = mimes[extname(real).toLowerCase()];
+        if (!resolvedMime) throw new BridgeError("unsupported_file_type");
+        mime = resolvedMime;
+        const stat = statSync(real);
         if (!stat.isFile()) throw new Error();
         if (stat.size > 5 * 1024 * 1024)
           throw new BridgeError("media_too_large");
-        bytes = readFileSync(q.file_path);
+        bytes = readFileSync(real);
       } catch (e) {
         if (e instanceof BridgeError) throw e;
         throw new BridgeError("file_unavailable");
